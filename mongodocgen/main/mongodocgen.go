@@ -2,7 +2,7 @@
 package main
 
 import (
-	//"fmt"
+	"fmt"
 	"github.com/mongodb/mongo-tools/common/db"
 	"github.com/mongodb/mongo-tools/common/log"
 	"github.com/mongodb/mongo-tools/common/options"
@@ -20,9 +20,10 @@ func main() {
 
 	generationOpts := &mongodocgen.GenerationOptions{}
 	opts.AddOptions(generationOpts)
+	ingestOpts := &mongodocgen.IngestOptions{}
+	opts.AddOptions(ingestOpts)
 
-	//args, err := opts.Parse()
-	_, err := opts.Parse()
+	args, err := opts.Parse()
 	if err != nil {
 		log.Logf(log.Always, "error parsing command line options: %v", err)
 		log.Logf(log.Always, "try 'mongodocgen --help' for more information")
@@ -47,16 +48,16 @@ func main() {
 	opts.ReplicaSetName = setName
 
 	// create a session provider to connect to the db
-	//sessionProvider, err := db.NewSessionProvider(*opts)
-	_, err = db.NewSessionProvider(*opts)
+	sessionProvider, err := db.NewSessionProvider(*opts)
 	if err != nil {
 		log.Logf(log.Always, "error connecting to host: %v", err)
 		os.Exit(util.ExitError)
 	}
 
-	/*m := mongodocgen.MongoDocGen {
+	m := mongodocgen.MongoDocGen {
 		ToolOptions:       opts,
 		GenerationOptions: generationOpts,
+		IngestOptions:     ingestOpts,
 		SessionProvider:   sessionProvider,
 	}
 
@@ -79,5 +80,5 @@ func main() {
 	}
 	if err != nil {
 		os.Exit(util.ExitError)
-	}*/
+	}
 }
