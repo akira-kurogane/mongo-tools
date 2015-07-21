@@ -112,27 +112,6 @@ func (imp *MongoDocGen) configureSession(session *mgo.Session) error {
 	return nil
 }
 
-type DocumentGenerator struct {
-	Template string //A dummy member as a placeholder for the template generator type to come later
-}
-
-func (imp *DocumentGenerator) StreamDocument(read chan bson.D) error {
-	//DEV in progress. Generates only empty BSON docs
-	go func() {
-		for i := 0; i < 3; i++ {
-			read <- bson.D{}
-		}
-		close(read)
-	}()
-	return nil
-}
-
-// getDocumentGenerator returns the DocumentGenerator instantiated with the template
-func (imp *MongoDocGen) getDocumentGenerator( /*TODO: pass template*/ ) (DocumentGenerator, error) {
-	template := "" //to fill the dummy string member
-	return DocumentGenerator{template}, nil
-}
-
 // GenerateDocuments is used to create the new docs according to the template,
 // and then insert them to the database. It returns the number of documents 
 // successfully imported to the appropriate namespace and any error encountered
@@ -143,7 +122,8 @@ func (imp *MongoDocGen) GenerateDocuments() (uint64, error) {
 		return 0, err
 	}*/
 
-	docGenerator, err := imp.getDocumentGenerator( /*TODO: pass template*/ )
+	template := "" //to fill the dummy string member
+	docGenerator, err := TemplateDocumentGenerator{template}, error(nil)
 	if err != nil {
 		return 0, err
 	}
@@ -163,7 +143,7 @@ func (imp *MongoDocGen) GenerateDocuments() (uint64, error) {
 	return imp.generateDocuments(docGenerator)
 }
 
-func (imp *MongoDocGen) generateDocuments(documentGenerator DocumentGenerator) (numInserted uint64, retErr error) {
+func (imp *MongoDocGen) generateDocuments(documentGenerator TemplateDocumentGenerator) (numInserted uint64, retErr error) {
 	session, err := imp.SessionProvider.GetSession()
 	if err != nil {
 		return 0, err
@@ -277,8 +257,14 @@ func (imp *MongoDocGen) runInsertionWorker(readDocs chan bson.D) (err error) {
 	var documents []bson.Raw
 	numMessageBytes := 0
 
+	batchSize := imp.ToolOptions.BulkBufferSize
+	j := 0
 readLoop:
 	for {
+		if int(imp.GenerationOptions.Num - imp.insertionCount) < batchSize {
+			batchSize = int(imp.GenerationOptions.Num - imp.insertionCount)
+		}
+		j++
 		select {
 		case document, alive := <-readDocs:
 			if !alive {
@@ -288,12 +274,15 @@ readLoop:
 			// limit so we self impose a limit by using maxMessageSizeBytes
 			// and send documents over the wire when we hit the batch size
 			// or when we're at/over the maximum message size threshold
-			if len(documents) == imp.ToolOptions.BulkBufferSize || numMessageBytes >= maxMessageSizeBytes {
+			if len(documents) == batchSize || numMessageBytes >= maxMessageSizeBytes {
 				if err = imp.insert(documents, collection); err != nil {
 					return err
 				}
 				documents = documents[:0]
 				numMessageBytes = 0
+				if imp.insertionCount >= imp.GenerationOptions.Num {
+					break readLoop
+				}
 			}
 
 			if documentBytes, err = bson.Marshal(document); err != nil {
@@ -303,14 +292,14 @@ readLoop:
 				log.Logf(log.Always, "warning: attempting to insert document with size %v (exceeds %v limit)",
 					text.FormatByteAmount(int64(len(documentBytes))), text.FormatByteAmount(maxBSONSize))
 			}
-			numMessageBytes += len(documentBytes)
+			numMessageBytes += len(documentBytes) //TODO sum and report this size at the end, or better yet with the progress
 			documents = append(documents, bson.Raw{3, documentBytes})
 		case <-imp.Dying():
 			return nil
 		}
 	}
 
-	// ingest any documents left in slice
+	// ingest any documents left in slice due to aborted read from readDocs chan
 	if len(documents) != 0 {
 		return imp.insert(documents, collection)
 	}

@@ -9,12 +9,13 @@ See http://docs.mongodb.org/manual/reference/program/mongodocgen/ for more infor
 // GenerationOptions defines the set of options for reading input data.
 type GenerationOptions struct {
 	// Fields is an option to directly specify comma-separated fields to import to CSV.
-	Num uint `long:"num" short:"n" description:"Number of documents to insert"`
+	Num uint64 `long:"num" short:"n" description:"Number of documents to insert"`
 
 	// Specifies the location and name of a file containing the data to import.
 	File string `long:"file" description:"file to import from; if not specified, stdin is used"`
 
 	//Dev note: The common ToolOptions has a NumDecodingWorkers option. Checked in mongoimport.ValidateSettings
+	//The equivalent for this tool would be to have a number of template generators
 }
 
 // Name returns a description of the GenerationOptions struct.
