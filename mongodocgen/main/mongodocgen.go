@@ -66,7 +66,6 @@ func main() {
 		log.Logf(log.Always, "try 'mongodocgen --help' for more information")
 		os.Exit(util.ExitError)
 	}
-	fmt.Printf("%#v\n", m.GenerationOptions)
 
 	numDocs, err := m.GenerateDocuments()
 	if !opts.Quiet {

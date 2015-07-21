@@ -135,8 +135,7 @@ func (imp *MongoDocGen) GenerateDocuments() (uint64, error) {
 		return 0, err
 	}*/
 
-	template := "" //to fill the dummy string member
-	docGenerator, err := TemplateDocumentGenerator{template}, error(nil)
+	docGenerator, err := NewTemplateDocumentGenerator(imp.GenerationOptions.Template)
 	if err != nil {
 		return 0, err
 	}
