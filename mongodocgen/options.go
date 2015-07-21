@@ -30,9 +30,8 @@ type IngestOptions struct {
 	// Sets the number of insertion routines to use
 	NumInsertionWorkers int `short:"j" long:"numInsertionWorkers" description:"number of insert operations to run concurrently (defaults to 1)" default:"1" default-mask:"-"`
 
-	//Devnote: mongoimport used the following option
-	//// Forces mongodocgen to halt the import operation at the first insert or upsert error.
-	//StopOnError bool `long:"stopOnError" description:"stop importing at first insert/upsert error"`
+	// Forces mongodocgen to halt the import operation at the first insert or upsert error.
+	StopOnError bool `long:"stopOnError" description:"stop importing at first insert/upsert error"`
 
 	// Sets write concern level for write operations.
 	WriteConcern string `long:"writeConcern" default:"majority" default-mask:"-" description:"write concern options e.g. --writeConcern majority, --writeConcern '{w: 3, wtimeout: 500, fsync: true, j: true}' (defaults to 'majority')"`
