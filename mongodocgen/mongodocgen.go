@@ -11,8 +11,8 @@ import (
 	"gopkg.in/mgo.v2"
 	"gopkg.in/mgo.v2/bson"
 	"gopkg.in/tomb.v2"
-	//"io"
-	//"os"
+	"io/ioutil"
+	"os"
 	//"path/filepath"
 	//"strings"
 	"sync"
@@ -54,9 +54,9 @@ type MongoDocGen struct {
 	nodeType db.NodeType
 }
 
-// ValidateSettings ensures that the tool specific options supplied for
+// ValidateOptions ensures that the tool specific options supplied for
 // MongoDocGen are valid.
-func (imp *MongoDocGen) ValidateSettings(args []string) error {
+func (imp *MongoDocGen) ValidateOptions(args []string) error {
 
 	if imp.ToolOptions.DB == "" {
 		imp.ToolOptions.DB = "test"
@@ -78,16 +78,29 @@ func (imp *MongoDocGen) ValidateSettings(args []string) error {
 		return fmt.Errorf("only one positional argument is allowed")
 	}
 
-	// ensure either a positional argument is supplied or an argument is passed
-	// to the --file flag - and not both
-	if imp.GenerationOptions.File != "" && len(args) != 0 {
-		return fmt.Errorf("incompatible options: --file and positional argument(s)")
-	}
-
-	if imp.GenerationOptions.File == "" {
-		if len(args) != 0 {
-			// if --file is not supplied, use the positional argument supplied
-			imp.GenerationOptions.File = args[0]
+	if len(args) == 0 {
+		bytes, err := ioutil.ReadAll(os.Stdin)
+		if err != nil {
+			return fmt.Errorf("Could not read from stdin")
+		}
+		imp.GenerationOptions.Template = string(bytes)
+		if imp.GenerationOptions.Template == "" {
+			return fmt.Errorf("No template string or template file path was supplied, nor was there any input on stdin")
+		}
+	} else {
+		argString := args[0]
+		if _, err := os.Stat(argString); os.IsNotExist(err) {
+			imp.GenerationOptions.Template = argString
+		} else {
+			templateFile, fileOpenErr := os.Open(argString)
+			if fileOpenErr != nil {
+				return fmt.Errorf("Failed to open template file \"%s\"", argString)
+			}
+			bytes, readallErr := ioutil.ReadAll(templateFile)
+			if readallErr != nil {
+				return fmt.Errorf("Failed to read from the file \"%s\"", argString)
+			}
+			imp.GenerationOptions.Template = string(bytes)
 		}
 	}
 

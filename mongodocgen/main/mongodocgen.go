@@ -61,11 +61,12 @@ func main() {
 		SessionProvider:   sessionProvider,
 	}
 
-	if err = m.ValidateSettings(args); err != nil {
-		log.Logf(log.Always, "error validating settings: %v", err)
+	if err = m.ValidateOptions(args); err != nil {
+		log.Logf(log.Always, "error validating options: %v", err)
 		log.Logf(log.Always, "try 'mongodocgen --help' for more information")
 		os.Exit(util.ExitError)
 	}
+	fmt.Printf("%#v\n", m.GenerationOptions)
 
 	numDocs, err := m.GenerateDocuments()
 	if !opts.Quiet {

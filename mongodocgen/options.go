@@ -1,6 +1,6 @@
 package mongodocgen
 
-var Usage = `<options> <file>
+var Usage = `<options> -n NUM <template>
 
 Generate and insert documents based on the template document written in JSON. If the template is not given as a command-line argument it is read from stdin.
 
@@ -8,14 +8,11 @@ See http://docs.mongodb.org/manual/reference/program/mongodocgen/ for more infor
 
 // GenerationOptions defines the set of options for reading input data.
 type GenerationOptions struct {
-	// Fields is an option to directly specify comma-separated fields to import to CSV.
+	// Num is the number of documents that should be inserted
 	Num uint64 `long:"num" short:"n" description:"Number of documents to insert"`
 
-	// Specifies the location and name of a file containing the data to import.
-	File string `long:"file" description:"file to import from; if not specified, stdin is used"`
-
-	//Dev note: The common ToolOptions has a NumDecodingWorkers option. Checked in mongoimport.ValidateSettings
-	//The equivalent for this tool would be to have a number of template generators
+	// Template string. Hidden as '--option' because it's a positional arg.
+	Template string `no-flag:"true" long:"template"`
 }
 
 // Name returns a description of the GenerationOptions struct.
