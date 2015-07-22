@@ -52,6 +52,9 @@ type MongoDocGen struct {
 
 	// type of node the SessionProvider is connected to
 	nodeType db.NodeType
+
+	// A count progressor used by the progress bar
+	countProgressor progress.Updateable
 }
 
 // ValidateOptions ensures that the tool specific options supplied for
@@ -130,25 +133,21 @@ func (imp *MongoDocGen) configureSession(session *mgo.Session) error {
 // successfully imported to the appropriate namespace and any error encountered
 // in doing this
 func (imp *MongoDocGen) GenerateDocuments() (uint64, error) {
-	/*template, err := imp.getParsedTemplate() //Maybe this should have already been created during option validation?
-	if err != nil {
-		return 0, err
-	}*/
-
 	docGenerator, err := NewTemplateDocumentGenerator(imp.GenerationOptions.Template)
 	if err != nil {
 		return 0, err
 	}
 
-	// DEVNOTE: currently this Progressor does get updated and is thus useless
-	// TODO: make it part of MongoDocGen or make a Progress() func and pass imp instead
-	watchProgressor := progress.NewCounter(int64(imp.GenerationOptions.Num))
+	targetCount := int64(imp.GenerationOptions.Num)
+	if targetCount < 1 {
+		targetCount = 1
+	}
+	imp.countProgressor = progress.NewCounter(int64(targetCount))
 	bar := &progress.Bar{
 		Name:      fmt.Sprintf("%v.%v", imp.ToolOptions.DB, imp.ToolOptions.Collection),
-		Watching:  watchProgressor,
+		Watching:  imp.countProgressor,
 		Writer:    log.Writer(0),
 		BarLength: progressBarLength,
-		IsBytes:   true,
 	}
 	bar.Start()
 	defer bar.Stop()
@@ -304,7 +303,7 @@ readLoop:
 				log.Logf(log.Always, "warning: attempting to insert document with size %v (exceeds %v limit)",
 					text.FormatByteAmount(int64(len(documentBytes))), text.FormatByteAmount(maxBSONSize))
 			}
-			numMessageBytes += len(documentBytes) //TODO sum and report this size at the end, or better yet with the progress
+			numMessageBytes += len(documentBytes)
 			documents = append(documents, bson.Raw{3, documentBytes})
 		case <-imp.Dying():
 			return nil
@@ -328,6 +327,7 @@ func (imp *MongoDocGen) insert(documents []bson.Raw, collection *mgo.Collection)
 	defer func() {
 		imp.insertionLock.Lock()
 		imp.insertionCount += uint64(numInserted)
+		imp.countProgressor.Set(int64(imp.insertionCount))
 		imp.insertionLock.Unlock()
 	}()
 

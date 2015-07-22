@@ -1,0 +1,24 @@
+{
+	"waaa": 1, 
+	"x": false, 
+	"new": "$number", 
+	"order": {
+		"loc": "$string", 
+		"sp": 800, 
+		"p": 8734, 
+		"rs": {"web": "abc.com"}
+	}, 
+	"invoices": [ 
+		{
+			"addr": {
+				"street": "florance", "street_no": "40"
+			}
+		}, 
+		{
+			"addr": "$geronimo"
+		}, 
+		44, 
+		"$objectid" 
+	],
+	"z": true 
+}
