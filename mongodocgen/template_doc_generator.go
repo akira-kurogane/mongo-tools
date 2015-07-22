@@ -7,27 +7,42 @@ import (
 )
 
 type TemplateDocumentGenerator struct {
-	Plug bson.M
+	Plug bson.D
 }
+
+func appendMapAsBsonD (doc bson.D, m map[string]interface{}) bson.D {
+	for name, value := range m {
+		switch value.(type) {
+		case map[string]interface{}:
+			//fmt.Printf("%s has type %T\n", name, t)
+			newNestedDocElem := appendMapAsBsonD(bson.D{}, value.(map[string]interface{}))
+			doc = append(doc, bson.DocElem{name, newNestedDocElem})
+		default:
+			//fmt.Printf("%s has type %T\n", name, t)
+			doc = append(doc, bson.DocElem{name, value})
+		}
+	}
+	return doc
+}
+
 
 func NewTemplateDocumentGenerator(templateString string) (TemplateDocumentGenerator, error) {
 	tdg := TemplateDocumentGenerator{}
-	var plug map[string]interface{}
-	err := json.Unmarshal([]byte(templateString), &plug)
+	var templateAsMap map[string]interface{}
+	err := json.Unmarshal([]byte(templateString), &templateAsMap)
 	if err != nil {
 		return tdg, fmt.Errorf("Template string was invalid JSON. %s", err)
 	}
-	tdg.Plug = bson.M(plug)
+	tdg.Plug = appendMapAsBsonD(tdg.Plug, templateAsMap)
 	return tdg, nil
 }
 
 func (tdg *TemplateDocumentGenerator) StreamDocument(read chan bson.D) error {
-	//DEV in progress. Generates only dummy BSON docs
 	go func() {
 		nextBatch := make([]bson.D, 1000)
 		for {
 			for i := range nextBatch {
-				nextBatch[i] = bson.D{} //tdg.Plug
+				nextBatch[i] = tdg.Plug
 			}
 			for i := range nextBatch {
 				read <- nextBatch[i]
