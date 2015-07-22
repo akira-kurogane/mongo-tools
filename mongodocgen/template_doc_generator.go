@@ -4,7 +4,30 @@ import (
 	"gopkg.in/mgo.v2/bson"
 	"encoding/json"
 	"fmt"
+	"crypto/rand"
+	"encoding/base64"
+	"math/big"
 )
+
+
+func randomInt(min int64, max int64) int64 {
+	argMax := *big.NewInt(max - min)
+	n, _ := rand.Int(rand.Reader, &argMax)
+	return n.Int64() + min
+}
+
+func randomString(l uint) string {
+	b := make([]byte, l)
+	_, err := rand.Read(b)
+	if err != nil {
+		fmt.Printf("failure to rand.Read(): %s\n", err)
+	}
+	return base64.URLEncoding.EncodeToString(b)[:l]
+}
+
+func newObjectId() bson.ObjectId {
+	return bson.NewObjectId()
+}
 
 type TemplateDocumentGenerator struct {
 	Plug bson.D
@@ -19,13 +42,7 @@ func appendMapAsBsonD (doc bson.D, m map[string]interface{}) bson.D {
 		case []interface{}:
 			newNestedArray := appendArrayAsBsonD(bson.D{}, value.([]interface{}))
 			doc = append(doc, bson.DocElem{name, newNestedArray})
-		case string:
-			if value.(string)[:1] == "$" {
-				value = "FUNC"
-			}
-			doc = append(doc, bson.DocElem{name, value})
 		default:
-			//fmt.Printf("%s has type %T\n", name, t)
 			doc = append(doc, bson.DocElem{name, value})
 		}
 	}
@@ -40,11 +57,6 @@ func appendArrayAsBsonD (doc bson.D, a []interface{}) []interface{} {
 			docElemArray[ord] = appendMapAsBsonD(bson.D{}, arrayVal.(map[string]interface{}))
 		case []interface{}:
 			docElemArray[ord] = appendArrayAsBsonD(bson.D{}, arrayVal.([]interface{}))
-		case string:
-			if arrayVal.(string)[:1] == "$" {
-				arrayVal = "FUNC"
-			}
-			docElemArray[ord] = arrayVal
 		default:
 			docElemArray[ord] = arrayVal
 		}
@@ -56,7 +68,7 @@ func NewTemplateDocumentGenerator(templateString string) (TemplateDocumentGenera
 	tdg := TemplateDocumentGenerator{}
 	var templateAsMap map[string]interface{}
 	err := json.Unmarshal([]byte(templateString), &templateAsMap)
-	fmt.Printf("%#v\n", templateAsMap)
+	//fmt.Printf("%#v\n", templateAsMap)
 	if err != nil {
 		return tdg, fmt.Errorf("Template string was invalid JSON. %s", err)
 	}
@@ -65,7 +77,6 @@ func NewTemplateDocumentGenerator(templateString string) (TemplateDocumentGenera
 }
 
 func stampOutDocElem(plugDocElem bson.DocElem) (bson.DocElem, error) {
-	//fmt.Printf("Value Type %T elem: %v\n", plugDocElem.Value, plugDocElem)
 	switch plugDocElem.Value.(type) {
 	case bson.D:
 		y, _ := stampOut(plugDocElem.Value.(bson.D))
@@ -78,8 +89,12 @@ func stampOutDocElem(plugDocElem bson.DocElem) (bson.DocElem, error) {
 		}
 		return bson.DocElem{plugDocElem.Name, a}, nil
 	case string:
-		if plugDocElem.Value.(string) == "FUNC" {
-			plugDocElem.Value = "FUNC -- 0000000"
+		if plugDocElem.Value.(string) == "$string" {
+			plugDocElem.Value = randomString(12)
+		} else if plugDocElem.Value.(string) == "$number" {
+			plugDocElem.Value = randomInt(0, 100)
+		} else if plugDocElem.Value.(string) == "$objectid" {
+			plugDocElem.Value = newObjectId()
 		}
 		return plugDocElem, nil
 	default:
