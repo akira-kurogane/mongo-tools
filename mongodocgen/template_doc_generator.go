@@ -29,6 +29,15 @@ func newObjectId() bson.ObjectId {
 	return bson.NewObjectId()
 }
 
+func randomBinary(l uint) (b []byte) {
+	b = make([]byte, l)
+	_, err := rand.Read(b)
+	if err != nil {
+		fmt.Printf("failure to rand.Read(): %s\n", err)
+	}
+	return
+}
+
 type TemplateDocumentGenerator struct {
 	Plug bson.D
 }
@@ -95,6 +104,8 @@ func stampOutDocElem(plugDocElem bson.DocElem) (bson.DocElem, error) {
 			plugDocElem.Value = randomInt(0, 100)
 		} else if plugDocElem.Value.(string) == "$objectid" {
 			plugDocElem.Value = newObjectId()
+		} else if plugDocElem.Value.(string) == "$bindata" {
+			plugDocElem.Value = bson.Binary{0x0, randomBinary(16)}
 		}
 		return plugDocElem, nil
 	default:
