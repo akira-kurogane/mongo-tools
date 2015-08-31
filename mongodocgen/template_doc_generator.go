@@ -38,8 +38,31 @@ func randomBinary(l uint) (b []byte) {
 	return
 }
 
+type BoundTemplateFunc func() interface{}
+
 type TemplateDocumentGenerator struct {
 	Plug bson.D
+}
+
+func makeBoundGeneratorFunc(desc string) BoundTemplateFunc {
+	if desc == "$string" {
+		return func() interface{} {
+			return randomString(12)
+		}
+	} else if desc == "$number" {
+		return func() interface{} {
+			return randomInt(0, 100)
+		}
+	} else if desc == "$objectid" {
+		return func() interface{} {
+			return newObjectId()
+		}
+	} else if desc == "$bindata" {
+		return func() interface{} {
+			return bson.Binary{0x0, randomBinary(16)}
+		}
+	}
+	return nil
 }
 
 func appendMapAsBsonD (doc bson.D, m map[string]interface{}) bson.D {
@@ -51,6 +74,13 @@ func appendMapAsBsonD (doc bson.D, m map[string]interface{}) bson.D {
 		case []interface{}:
 			newNestedArray := appendArrayAsBsonD(bson.D{}, value.([]interface{}))
 			doc = append(doc, bson.DocElem{name, newNestedArray})
+		case string:
+			f := makeBoundGeneratorFunc(value.(string))
+			if f != nil {
+				doc = append(doc, bson.DocElem{name, f})
+			} else {
+				doc = append(doc, bson.DocElem{name, value})
+			}
 		default:
 			doc = append(doc, bson.DocElem{name, value})
 		}
@@ -67,7 +97,17 @@ func appendArrayAsBsonD (doc bson.D, a []interface{}) []interface{} {
 		case []interface{}:
 			docElemArray[ord] = appendArrayAsBsonD(bson.D{}, arrayVal.([]interface{}))
 		default:
-			docElemArray[ord] = arrayVal
+			switch arrayVal.(type) {
+			case string:
+				f := makeBoundGeneratorFunc(arrayVal.(string))
+				if f != nil {
+					docElemArray[ord] = f
+				} else {
+					docElemArray[ord] = arrayVal
+				}
+			default:
+				docElemArray[ord] = arrayVal
+			}
 		}
 	}
 	return docElemArray
@@ -97,16 +137,8 @@ func stampOutDocElem(plugDocElem bson.DocElem) (bson.DocElem, error) {
 			a[ord] = x.Value
 		}
 		return bson.DocElem{plugDocElem.Name, a}, nil
-	case string:
-		if plugDocElem.Value.(string) == "$string" {
-			plugDocElem.Value = randomString(12)
-		} else if plugDocElem.Value.(string) == "$number" {
-			plugDocElem.Value = randomInt(0, 100)
-		} else if plugDocElem.Value.(string) == "$objectid" {
-			plugDocElem.Value = newObjectId()
-		} else if plugDocElem.Value.(string) == "$bindata" {
-			plugDocElem.Value = bson.Binary{0x0, randomBinary(16)}
-		}
+	case BoundTemplateFunc:
+		plugDocElem.Value = plugDocElem.Value.(BoundTemplateFunc)()
 		return plugDocElem, nil
 	default:
 		return plugDocElem, nil
