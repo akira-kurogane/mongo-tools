@@ -2,6 +2,7 @@
 	"waaa": 1, 
 	"x": false, 
 	"new": { "generator_func": "RandomInt", "min": 0, "max": 100 }, 
+	"raw_input": { "generator_func": "RandomBinary", "len": 3 },
 	"order": {
 		"loc": { "generator_func": "RandomString",  "len": 4 }, 
 		"sp": 800, 

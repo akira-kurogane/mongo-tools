@@ -5,39 +5,7 @@ import (
 	"gopkg.in/mgo.v2/bson"
 	"encoding/json"
 	"fmt"
-	"crypto/rand"
-	"encoding/base64"
-	"math/big"
 )
-
-
-func randomInt(min int64, max int64) int64 {
-	argMax := *big.NewInt(max - min)
-	n, _ := rand.Int(rand.Reader, &argMax)
-	return n.Int64() + min
-}
-
-func randomString(l uint) string {
-	b := make([]byte, l)
-	_, err := rand.Read(b)
-	if err != nil {
-		fmt.Printf("failure to rand.Read(): %s\n", err)
-	}
-	return base64.URLEncoding.EncodeToString(b)[:l]
-}
-
-func newObjectId() bson.ObjectId {
-	return bson.NewObjectId()
-}
-
-func randomBinary(l uint) (b []byte) {
-	b = make([]byte, l)
-	_, err := rand.Read(b)
-	if err != nil {
-		fmt.Printf("failure to rand.Read(): %s\n", err)
-	}
-	return
-}
 
 type BoundTemplateFunc func() interface{}
 
@@ -48,79 +16,23 @@ type TemplateDocumentGenerator struct {
 func makeBoundGeneratorFunc(m map[string]interface{}) BoundTemplateFunc {
 	gfn := m["generator_func"]
 	if gfn == "RandomString" {
-		var l uint = 12
-		_l, ok := m["len"]
-		if ok {
-			switch _l.(type) {
-			case float64:
-				l = uint(_l.(float64))
-			case json.Number:
-				_jni, err := _l.(json.Number).Int64()
-				if err == nil {
-					l = uint(_jni)
-				}
-			default:
-				log.Logf(log.Always, "The \"len\" value in the \"%s\" generator_func object was ignored because it was not a float64 or json.Number type. It was = %#v.", gfn, _l)
-			}
-		}
+		opts := MapToRandomStringOpts(m)
 		return func() interface{} {
-			return randomString(l)
+			return RandomString(opts.Length)
 		}
 	} else if gfn == "RandomInt" {
-		var min, max int64 = 0, 100
-		_min, ok := m["min"]
-		if ok {
-			switch _min.(type) {
-			case float64:
-				min = int64(_min.(float64))
-			case json.Number:
-				_jni, err := _min.(json.Number).Int64()
-				if err == nil {
-					min = _jni
-				}
-			default:
-				log.Logf(log.Always, "The \"min\" value in the \"%s\" generator_func object was ignored because it was not a float64 or json.Number type. It was = %#v.", gfn, _min)
-			}
-		}
-		_max, ok := m["max"]
-		if ok {
-			switch _max.(type) {
-			case float64:
-				max = int64(_max.(float64))
-			case json.Number:
-				_jni, err := _max.(json.Number).Int64()
-				if err == nil {
-					max = _jni
-				}
-			default:
-				log.Logf(log.Always, "The \"max\" value in the \"%s\" generator_func object was ignored because it was not a float64 or json.Number type. It was = %#v.", gfn, _max)
-			}
-		}
+		opts := MapToRandomIntOpts(m)
 		return func() interface{} {
-			return randomInt(min, max)
+			return RandomInt(opts.Min, opts.Max)
 		}
 	} else if gfn == "ObjectId" {
 		return func() interface{} {
-			return newObjectId()
+			return NewObjectId()
 		}
 	} else if gfn == "RandomBinary" {
-		var l uint = 12
-		_l, ok := m["len"]
-		if ok {
-			switch _l.(type) {
-			case float64:
-				l = uint(_l.(float64))
-			case json.Number:
-				_jni, err := _l.(json.Number).Int64()
-				if err == nil {
-					l = uint(_jni)
-				}
-			default:
-				log.Logf(log.Always, "The \"len\" value in the \"%s\" generator_func object was ignored because it was not a float64 or json.Number type. It was = %#v.", gfn, _l)
-			}
-		}
+		opts := MapToRandomBinaryOpts(m)
 		return func() interface{} {
-			return bson.Binary{0x0, randomBinary(l)}
+			return bson.Binary{0x0, RandomBinary(opts.Length)}
 		}
 	} else {
 		log.Logf(log.Always, "A generator_func value %v was encountered. As it did not (case-sensitively) match any of the expected generator function names it is being ignored", gfn)
