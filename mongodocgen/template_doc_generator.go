@@ -1,6 +1,7 @@
 package mongodocgen
 
 import (
+	"github.com/mongodb/mongo-tools/common/log"
 	"gopkg.in/mgo.v2/bson"
 	"encoding/json"
 	"fmt"
@@ -44,23 +45,85 @@ type TemplateDocumentGenerator struct {
 	Plug bson.D
 }
 
-func makeBoundGeneratorFunc(desc string) BoundTemplateFunc {
-	if desc == "$string" {
-		return func() interface{} {
-			return randomString(12)
+func makeBoundGeneratorFunc(m map[string]interface{}) BoundTemplateFunc {
+	gfn := m["generator_func"]
+	if gfn == "RandomString" {
+		var l uint = 12
+		_l, ok := m["len"]
+		if ok {
+			switch _l.(type) {
+			case float64:
+				l = uint(_l.(float64))
+			case json.Number:
+				_jni, err := _l.(json.Number).Int64()
+				if err == nil {
+					l = uint(_jni)
+				}
+			default:
+				log.Logf(log.Always, "The \"len\" value in the \"%s\" generator_func object was ignored because it was not a float64 or json.Number type. It was = %#v.", gfn, _l)
+			}
 		}
-	} else if desc == "$number" {
 		return func() interface{} {
-			return randomInt(0, 100)
+			return randomString(l)
 		}
-	} else if desc == "$objectid" {
+	} else if gfn == "RandomInt" {
+		var min, max int64 = 0, 100
+		_min, ok := m["min"]
+		if ok {
+			switch _min.(type) {
+			case float64:
+				min = int64(_min.(float64))
+			case json.Number:
+				_jni, err := _min.(json.Number).Int64()
+				if err == nil {
+					min = _jni
+				}
+			default:
+				log.Logf(log.Always, "The \"min\" value in the \"%s\" generator_func object was ignored because it was not a float64 or json.Number type. It was = %#v.", gfn, _min)
+			}
+		}
+		_max, ok := m["max"]
+		if ok {
+			switch _max.(type) {
+			case float64:
+				max = int64(_max.(float64))
+			case json.Number:
+				_jni, err := _max.(json.Number).Int64()
+				if err == nil {
+					max = _jni
+				}
+			default:
+				log.Logf(log.Always, "The \"max\" value in the \"%s\" generator_func object was ignored because it was not a float64 or json.Number type. It was = %#v.", gfn, _max)
+			}
+		}
+		return func() interface{} {
+			return randomInt(min, max)
+		}
+	} else if gfn == "ObjectId" {
 		return func() interface{} {
 			return newObjectId()
 		}
-	} else if desc == "$bindata" {
-		return func() interface{} {
-			return bson.Binary{0x0, randomBinary(16)}
+	} else if gfn == "RandomBinary" {
+		var l uint = 12
+		_l, ok := m["len"]
+		if ok {
+			switch _l.(type) {
+			case float64:
+				l = uint(_l.(float64))
+			case json.Number:
+				_jni, err := _l.(json.Number).Int64()
+				if err == nil {
+					l = uint(_jni)
+				}
+			default:
+				log.Logf(log.Always, "The \"len\" value in the \"%s\" generator_func object was ignored because it was not a float64 or json.Number type. It was = %#v.", gfn, _l)
+			}
 		}
+		return func() interface{} {
+			return bson.Binary{0x0, randomBinary(l)}
+		}
+	} else {
+		log.Logf(log.Always, "A generator_func value %v was encountered. As it did not (case-sensitively) match any of the expected generator function names it is being ignored", gfn)
 	}
 	return nil
 }
@@ -69,18 +132,20 @@ func appendMapAsBsonD (doc bson.D, m map[string]interface{}) bson.D {
 	for name, value := range m {
 		switch value.(type) {
 		case map[string]interface{}:
-			newNestedDocElem := appendMapAsBsonD(bson.D{}, value.(map[string]interface{}))
-			doc = append(doc, bson.DocElem{name, newNestedDocElem})
-		case []interface{}:
-			newNestedArray := appendArrayAsBsonD(bson.D{}, value.([]interface{}))
-			doc = append(doc, bson.DocElem{name, newNestedArray})
-		case string:
-			f := makeBoundGeneratorFunc(value.(string))
+			_, elem_found := value.(map[string]interface{})["generator_func"]
+			var f BoundTemplateFunc
+			if elem_found {
+				f = makeBoundGeneratorFunc(value.(map[string]interface{}))
+			}
 			if f != nil {
 				doc = append(doc, bson.DocElem{name, f})
 			} else {
-				doc = append(doc, bson.DocElem{name, value})
+				newNestedDocElem := appendMapAsBsonD(bson.D{}, value.(map[string]interface{}))
+				doc = append(doc, bson.DocElem{name, newNestedDocElem})
 			}
+		case []interface{}:
+			newNestedArray := appendArrayAsBsonD(bson.D{}, value.([]interface{}))
+			doc = append(doc, bson.DocElem{name, newNestedArray})
 		default:
 			doc = append(doc, bson.DocElem{name, value})
 		}
@@ -93,21 +158,20 @@ func appendArrayAsBsonD (doc bson.D, a []interface{}) []interface{} {
 	for ord, arrayVal := range a {
 		switch arrayVal.(type) {
 		case map[string]interface{}:
-			docElemArray[ord] = appendMapAsBsonD(bson.D{}, arrayVal.(map[string]interface{}))
+			_, elem_found := arrayVal.(map[string]interface{})["generator_func"]
+			var f BoundTemplateFunc
+			if elem_found {
+				f = makeBoundGeneratorFunc(arrayVal.(map[string]interface{}))
+			}
+			if f != nil {
+				docElemArray[ord] = f
+			} else {
+				docElemArray[ord] = appendMapAsBsonD(bson.D{}, arrayVal.(map[string]interface{}))
+			}
 		case []interface{}:
 			docElemArray[ord] = appendArrayAsBsonD(bson.D{}, arrayVal.([]interface{}))
 		default:
-			switch arrayVal.(type) {
-			case string:
-				f := makeBoundGeneratorFunc(arrayVal.(string))
-				if f != nil {
-					docElemArray[ord] = f
-				} else {
-					docElemArray[ord] = arrayVal
-				}
-			default:
-				docElemArray[ord] = arrayVal
-			}
+			docElemArray[ord] = arrayVal
 		}
 	}
 	return docElemArray
