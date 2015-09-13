@@ -3,6 +3,8 @@
 	"x": false, 
 	"new": { "generator_func": "RandomInt", "min": 0, "max": 100 }, 
 	"raw_input": { "generator_func": "RandomBinary", "len": 3 },
+	"now": { "generator_func": "CurrentTimestamp" },
+	"bill_ts": { "generator_func": "RandomTimestamp", "start_ts": "2012-01-01", "end_ts": "2013-01-01" },
 	"order": {
 		"loc": { "generator_func": "RandomString",  "len": 4 }, 
 		"sp": 800, 

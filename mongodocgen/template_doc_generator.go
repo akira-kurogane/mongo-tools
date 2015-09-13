@@ -34,6 +34,19 @@ func makeBoundGeneratorFunc(m map[string]interface{}) BoundTemplateFunc {
 		return func() interface{} {
 			return bson.Binary{0x0, RandomBinary(opts.Length)}
 		}
+	} else if gfn == "CurrentTimestamp" {
+		return func() interface{} {
+			return CurrentTimestamp()
+		}
+	} else if gfn == "RandomTimestamp" {
+		opts := MapToTimestampOpts(m)
+		return func() interface{} {
+			t, err := RandomTimestamp(opts.StartTs, opts.EndTs)
+			if err != nil {
+				return err
+			}
+			return t
+		}
 	} else {
 		log.Logf(log.Always, "A generator_func value %v was encountered. As it did not (case-sensitively) match any of the expected generator function names it is being ignored", gfn)
 	}
