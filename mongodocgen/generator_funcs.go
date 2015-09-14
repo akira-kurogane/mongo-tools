@@ -40,6 +40,20 @@ func corralToUInt (gfn string, jdmv interface{}, x *uint) {
 	}
 }
 
+func corralToFloat64 (gfn string, jdmv interface{}, x *float64) {
+	switch jdmv.(type) {
+	case float64:
+		*x = jdmv.(float64)
+	case json.Number:
+		_jni, err := jdmv.(json.Number).Float64()
+		if err == nil {
+			*x = _jni
+		}
+	default:
+		log.Logf(log.Always, "The \"min\" value in the \"%s\" generator_func object was ignored because it was not a float64 or json.Number type. It was = %#v.", gfn, jdmv)
+	}
+}
+
 func corralToTimestamp (gfn string, jdmv interface{}, x *time.Time) {
 	switch jdmv.(type) {
 	case string:
@@ -181,4 +195,35 @@ func RandomTimestamp(s time.Time, e time.Time) (t time.Time, err error) {
 	argMax := *big.NewInt(int64(e.Sub(s)/time.Nanosecond))
 	n, _ := rand.Int(rand.Reader, &argMax)
 	return s.Add(time.Duration(n.Int64()) * time.Nanosecond), nil
+}
+
+type SequenceOpts struct {
+	Start float64
+	Step float64
+}
+func MapToSequenceOpts(m map[string]interface{}) (o SequenceOpts) {
+	gfn := "Sequence"
+	_s, ok := m["start"]
+	if ok {
+		corralToFloat64(gfn, _s, &o.Start)
+	} else {
+		o.Start = 0
+	}
+	_p, ok := m["step"]
+	if ok {
+		corralToFloat64(gfn, _p, &o.Step)
+	} else {
+		o.Step = 1
+	}
+	return
+}
+
+func CreateNewSequenceFunc(Start float64, Step float64) BoundTemplateFunc {
+	x := Start
+	step := Step
+	return func() interface{} {
+		_x := x
+		x = x + step
+		return _x
+	}
 }

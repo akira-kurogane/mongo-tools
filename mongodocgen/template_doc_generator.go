@@ -47,6 +47,11 @@ func makeBoundGeneratorFunc(m map[string]interface{}) BoundTemplateFunc {
 			}
 			return t
 		}
+	} else if gfn == "Sequence" {
+		opts := MapToSequenceOpts(m)
+		seqFunc := CreateNewSequenceFunc(opts.Start, opts.Step)
+		log.Logf(log.DebugLow, "A sequence for (Start = %f, Step = %f) is created.", gfn)
+		return seqFunc
 	} else {
 		log.Logf(log.Always, "A generator_func value %v was encountered. As it did not (case-sensitively) match any of the expected generator function names it is being ignored", gfn)
 	}
