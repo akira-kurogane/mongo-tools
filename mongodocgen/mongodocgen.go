@@ -25,6 +25,8 @@ const (
 	progressBarLength = 24
 )
 
+// MongoDocGen is the main class that receives the options, begins the 
+// document generation, and inserts to the database.
 type MongoDocGen struct {
 	// generic mongo tool options
 	ToolOptions *options.ToolOptions
