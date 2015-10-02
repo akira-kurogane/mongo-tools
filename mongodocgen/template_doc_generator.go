@@ -13,49 +13,64 @@ type TemplateDocumentGenerator struct {
 	Plug bson.D
 }
 
-func makeBoundGeneratorFunc(m map[string]interface{}) BoundTemplateFunc {
+func makeBoundGeneratorFunc(m map[string]interface{}) (BoundTemplateFunc, error) {
 	gfn := m["generator_func"]
 	if gfn == "RandomString" {
-		opts := MapToRandomStringOpts(m)
+		opts, err := MapToRandomStringOpts(m)
+		if err != nil {
+			return nil, err
+		}
 		return func() interface{} {
 			return RandomString(opts.Length)
-		}
+		}, nil
 	} else if gfn == "RandomInt" {
-		opts := MapToRandomIntOpts(m)
+		opts, err := MapToRandomIntOpts(m)
+		if err != nil {
+			return nil, err
+		}
 		return func() interface{} {
 			return RandomInt(opts.Min, opts.Max)
-		}
+		}, nil
 	} else if gfn == "ObjectId" {
 		return func() interface{} {
 			return NewObjectId()
-		}
+		}, nil
 	} else if gfn == "RandomBinary" {
-		opts := MapToRandomBinaryOpts(m)
+		opts, err := MapToRandomBinaryOpts(m)
+		if err != nil {
+			return nil, err
+		}
 		return func() interface{} {
 			return bson.Binary{0x0, RandomBinary(opts.Length)}
-		}
+		}, nil
 	} else if gfn == "CurrentTimestamp" {
 		return func() interface{} {
 			return CurrentTimestamp()
-		}
+		}, nil
 	} else if gfn == "RandomTimestamp" {
-		opts := MapToTimestampOpts(m)
+		opts, err := MapToTimestampOpts(m)
+		if err != nil {
+			return nil, err
+		}
 		return func() interface{} {
 			t, err := RandomTimestamp(opts.StartTs, opts.EndTs)
 			if err != nil {
 				return err
 			}
 			return t
-		}
+		}, nil
 	} else if gfn == "Sequence" {
-		opts := MapToSequenceOpts(m)
+		opts, err := MapToSequenceOpts(m)
+		if err != nil {
+			return nil, err
+		}
 		seqFunc := CreateNewSequenceFunc(opts.Start, opts.Step)
 		log.Logf(log.DebugLow, "A sequence for (Start = %f, Step = %f) is created.", gfn)
-		return seqFunc
+		return seqFunc, nil
 	} else {
 		log.Logf(log.Always, "A generator_func value %v was encountered. As it did not (case-sensitively) match any of the expected generator function names it is being ignored", gfn)
 	}
-	return nil
+	return nil, nil
 }
 
 func appendMapAsBsonD (doc bson.D, m map[string]interface{}) bson.D {
@@ -64,8 +79,12 @@ func appendMapAsBsonD (doc bson.D, m map[string]interface{}) bson.D {
 		case map[string]interface{}:
 			_, elem_found := value.(map[string]interface{})["generator_func"]
 			var f BoundTemplateFunc
+			var err error
 			if elem_found {
-				f = makeBoundGeneratorFunc(value.(map[string]interface{}))
+				f, err = makeBoundGeneratorFunc(value.(map[string]interface{}))
+				if err != nil {
+					log.Logf(log.Always, "Could not parse \"%s\" (%#v) into a generator function due to following error: %s", name, value.(map[string]interface{}), err.Error())
+				}
 			}
 			if f != nil {
 				doc = append(doc, bson.DocElem{name, f})
@@ -90,8 +109,12 @@ func appendArrayAsBsonD (doc bson.D, a []interface{}) []interface{} {
 		case map[string]interface{}:
 			_, elem_found := arrayVal.(map[string]interface{})["generator_func"]
 			var f BoundTemplateFunc
+			var err error
 			if elem_found {
-				f = makeBoundGeneratorFunc(arrayVal.(map[string]interface{}))
+				f, err = makeBoundGeneratorFunc(arrayVal.(map[string]interface{}))
+				if err != nil {
+					log.Logf(log.Always, "Could not parse %#v into a generator function due to following error: %s", arrayVal.(map[string]interface{}), err.Error())
+				}
 			}
 			if f != nil {
 				docElemArray[ord] = f

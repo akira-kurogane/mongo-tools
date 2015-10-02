@@ -5,66 +5,84 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"github.com/mongodb/mongo-tools/common/log"
 	"gopkg.in/mgo.v2/bson"
 	"math"
 	"math/big"
 	"time"
 )
 
+type CorralingError struct {
+	InputValue interface{}
+	ExpectedInputType string
+	ExpectedOutputType string
+}
+
+func (e *CorralingError) Error() string {
+	return fmt.Sprintf("Could not convert the %T value %#v to a %s because it was not a %s.", e.InputValue, e.InputValue, e.ExpectedOutputType, e.ExpectedInputType)
+}
+
 // Convenience function for converting a numeric type returned by the standard 
 // json decoder lib to int64, which is the integer type the mgo lib expects in
 // its bson structs.
-func corralToInt64 (jdmv interface{}, x *int64) {
+func corralToInt64 (jdmv interface{}, x *int64) error {
 	switch jdmv.(type) {
 	case float64:
 		*x = int64(jdmv.(float64))
+		return nil
 	case json.Number:
 		_jni, err := jdmv.(json.Number).Int64()
 		if err == nil {
 			*x = _jni
 		}
-	default:
-		log.Logf(log.Always, "The \"min\" value in the \"%s\" generator_func object was ignored because it was not a float64 or json.Number type. It was = %#v.", jdmv)
+		return nil
 	}
+	return &CorralingError{jdmv, "float64, json.Number", "int64"}
 }
 
 // Convenience function for converting a numeric type returned by the standard 
 // json decoder lib to uint. Used to assert length values are >= 0, etc.
-func corralToUInt (jdmv interface{}, x *uint) {
+func corralToUInt (jdmv interface{}, x *uint) error {
 	switch jdmv.(type) {
 	case float64:
+		if jdmv.(float64) < 0 {
+			return fmt.Errorf("Negative value %v encountered in corralToUInt()", jdmv)
+		}
 		*x = uint(jdmv.(float64))
+		return nil
 	case json.Number:
 		_jni, err := jdmv.(json.Number).Int64()
+		if _jni < 0 {
+			return fmt.Errorf("Negative value %v encountered in corralToUInt()", jdmv)
+		}
 		if err == nil {
 			*x = uint(_jni)
 		}
-	default:
-		log.Logf(log.Always, "The \"min\" value in the \"%s\" generator_func object was ignored because it was not a float64 or json.Number type. It was = %#v.", jdmv)
+		return nil
 	}
+	return &CorralingError{jdmv, "float64, json.Number", "uint"}
 }
 
 // Convenience function for converting a numeric type returned by the standard 
 // json decoder lib to float64, which is the type the mgo lib expects in it's
 // bson structs.
-func corralToFloat64 (jdmv interface{}, x *float64) {
+func corralToFloat64 (jdmv interface{}, x *float64) error {
 	switch jdmv.(type) {
 	case float64:
 		*x = jdmv.(float64)
+		return nil
 	case json.Number:
 		_jni, err := jdmv.(json.Number).Float64()
 		if err == nil {
 			*x = _jni
 		}
-	default:
-		log.Logf(log.Always, "The \"min\" value in the \"%s\" generator_func object was ignored because it was not a float64 or json.Number type. It was = %#v.", jdmv)
+		return nil
 	}
+	return &CorralingError{jdmv, "float64, json.Number", "int64"}
 }
 
 // Convenience function for converting a ISO 8601 datetime string to a standard 
 // time.Time struct.
-func corralToTimestamp (jdmv interface{}, x *time.Time) {
+func corralToTimestamp (jdmv interface{}, x *time.Time) error {
 	switch jdmv.(type) {
 	// time.Parse seems to strictly require all the fields in the string, e.g. 
 	// it won't assume 00:00:00 as the time when only the date is specified. 
@@ -82,12 +100,12 @@ func corralToTimestamp (jdmv interface{}, x *time.Time) {
 			_x, err = time.Parse(time.RFC3339, jdmv.(string))
 		}
 		if err != nil {
-			log.Logf(log.Always, "Parse Error: %v\n", err)
+			return err
 		}
 		*x = _x
-	default:
-		log.Logf(log.Always, "corralToTimestamp() cannot convert the value %#v to a timestamp because it was not a string.", jdmv)
+		return nil
 	}
+	return &CorralingError{jdmv, "string", "time.Time"}
 }
 
 type RandomIntOpts struct {
@@ -96,14 +114,22 @@ type RandomIntOpts struct {
 }
 
 // Makes a RandomIntOpts struct out of a variable map[string] representation of the same options.
-func MapToRandomIntOpts(m map[string]interface{}) (o RandomIntOpts) {
+func MapToRandomIntOpts(m map[string]interface{}) (o RandomIntOpts, e error) {
 	_min, ok := m["min"]
 	if ok {
-		corralToInt64(_min, &o.Min)
+		err := corralToInt64(_min, &o.Min)
+		if err != nil {
+			e = err
+			return
+		}
 	}
 	_max, ok := m["max"]
 	if ok {
-		corralToInt64(_max, &o.Max)
+		err := corralToInt64(_max, &o.Max)
+		if err != nil {
+			e = err
+			return
+		}
 	}
 	//min and max both being 0 is assumed to be just zero-value defaults.
 	//Assign to whole int64 range instead.
@@ -126,10 +152,14 @@ type RandomStringOpts struct {
 }
 
 // Makes a RandomStringOpts struct out of a variable map[string] representation of the same options.
-func MapToRandomStringOpts(m map[string]interface{}) (o RandomStringOpts) {
+func MapToRandomStringOpts(m map[string]interface{}) (o RandomStringOpts, e error) {
 	_l, ok := m["len"]
 	if ok {
-		corralToUInt(_l, &o.Length)
+		err := corralToUInt(_l, &o.Length)
+		if err != nil {
+			e = err
+			return
+		}
 	}
 	//Assume zero is zero-by-default. Set 12 as default instead
 	if o.Length == 0 {
@@ -157,10 +187,14 @@ type RandomBinaryOpts struct {
 }
 
 // Makes a RandomBinaryOpts struct out of a variable map[string] representation of the same options.
-func MapToRandomBinaryOpts(m map[string]interface{}) (o RandomBinaryOpts) {
+func MapToRandomBinaryOpts(m map[string]interface{}) (o RandomBinaryOpts, e error) {
 	_l, ok := m["len"]
 	if ok {
-		corralToUInt(_l, &o.Length)
+		err := corralToUInt(_l, &o.Length)
+		if err != nil {
+			e = err
+			return
+		}
 	}
 	//Assume zero is zero-by-default. Set 12 as default instead
 	if o.Length == 0 {
@@ -184,14 +218,22 @@ type TimestampOpts struct {
 }
 
 // Makes a TimestampOpts struct out of a variable map[string] representation of the same options.
-func MapToTimestampOpts(m map[string]interface{}) (o TimestampOpts) {
+func MapToTimestampOpts(m map[string]interface{}) (o TimestampOpts, e error) {
 	_s, ok := m["start_ts"]
 	if ok {
-		corralToTimestamp(_s, &o.StartTs)
+		err := corralToTimestamp(_s, &o.StartTs)
+		if err != nil {
+			e = err
+			return
+		}
 	}
 	_e, ok := m["end_ts"]
 	if ok {
-		corralToTimestamp(_e, &o.EndTs)
+		err := corralToTimestamp(_e, &o.EndTs)
+		if err != nil {
+			e = err
+			return
+		}
 	}
 	//start and end both being 0 is assumed to be just zero-value defaults.
 	//Assign to whole date range instead.
@@ -222,16 +264,24 @@ type SequenceOpts struct {
 }
 
 // Makes a SequenceOpts struct out of a variable map[string] representation of the same options.
-func MapToSequenceOpts(m map[string]interface{}) (o SequenceOpts) {
+func MapToSequenceOpts(m map[string]interface{}) (o SequenceOpts, e error) {
 	_s, ok := m["start"]
 	if ok {
-		corralToFloat64(_s, &o.Start)
+		err := corralToFloat64(_s, &o.Start)
+		if err != nil {
+			e = err
+			return
+		}
 	} else {
 		o.Start = 0
 	}
 	_p, ok := m["step"]
 	if ok {
-		corralToFloat64(_p, &o.Step)
+		err := corralToFloat64(_p, &o.Step)
+		if err != nil {
+			e = err
+			return
+		}
 	} else {
 		o.Step = 1
 	}
