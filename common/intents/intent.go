@@ -11,6 +11,7 @@ import (
 type file interface {
 	io.ReadWriteCloser
 	Open() error
+	Pos() int64
 }
 
 // mongorestore first scans the directory to generate a list
@@ -21,14 +22,13 @@ type Intent struct {
 	C  string
 
 	// File locations as absolute paths
-	BSONPath     string
 	BSONFile     file
 	BSONSize     int64
-	MetadataPath string
 	MetadataFile file
 
 	// Indicates where the intent will be read from or written to
-	Location string
+	Location         string
+	MetadataLocation string
 
 	// Collection options
 	Options *bson.D
@@ -77,7 +77,7 @@ func (it *Intent) IsAuthVersion() bool {
 }
 
 func (it *Intent) IsSystemIndexes() bool {
-	return it.C == "system.indexes" && it.BSONPath != ""
+	return it.C == "system.indexes" && it.BSONFile != nil
 }
 
 func (intent *Intent) IsSpecialCollection() bool {
@@ -152,21 +152,21 @@ func (manager *Manager) Put(intent *Intent) {
 		return
 	}
 	if intent.IsUsers() {
-		if intent.BSONPath != "" {
+		if intent.BSONFile != nil {
 			manager.usersIntent = intent
 			manager.specialIntents[intent.Namespace()] = intent
 		}
 		return
 	}
 	if intent.IsRoles() {
-		if intent.BSONPath != "" {
+		if intent.BSONFile != nil {
 			manager.rolesIntent = intent
 			manager.specialIntents[intent.Namespace()] = intent
 		}
 		return
 	}
 	if intent.IsAuthVersion() {
-		if intent.BSONPath != "" {
+		if intent.BSONFile != nil {
 			manager.versionIntent = intent
 			manager.specialIntents[intent.Namespace()] = intent
 		}
@@ -179,20 +179,20 @@ func (manager *Manager) Put(intent *Intent) {
 	// state of the filepath walker
 	if existing := manager.intents[intent.Namespace()]; existing != nil {
 		// merge new intent into old intent
-		if existing.BSONPath == "" {
-			existing.BSONPath = intent.BSONPath
-		}
 		if existing.BSONFile == nil {
 			existing.BSONFile = intent.BSONFile
 		}
 		if existing.Size == 0 {
 			existing.Size = intent.Size
 		}
-		if existing.MetadataPath == "" {
-			existing.MetadataPath = intent.MetadataPath
+		if existing.Location == "" {
+			existing.Location = intent.Location
 		}
 		if existing.MetadataFile == nil {
 			existing.MetadataFile = intent.MetadataFile
+		}
+		if existing.MetadataLocation == "" {
+			existing.MetadataLocation = intent.MetadataLocation
 		}
 		return
 	}

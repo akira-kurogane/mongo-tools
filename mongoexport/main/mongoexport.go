@@ -8,6 +8,8 @@ import (
 	"github.com/mongodb/mongo-tools/common/signals"
 	"github.com/mongodb/mongo-tools/common/util"
 	"github.com/mongodb/mongo-tools/mongoexport"
+	"gopkg.in/mgo.v2"
+	"gopkg.in/mgo.v2/bson"
 	"os"
 )
 
@@ -52,6 +54,51 @@ func main() {
 	opts.ReplicaSetName = setName
 
 	provider, err := db.NewSessionProvider(*opts)
+
+	// temporarily allow secondary reads for the isMongos check
+	provider.SetReadPreference(mgo.Nearest)
+	isMongos, err := provider.IsMongos()
+	if err != nil {
+		log.Logf(log.Always, "%v", err)
+		os.Exit(util.ExitError)
+	}
+
+	provider.SetFlags(db.DisableSocketTimeout)
+
+	if inputOpts.SlaveOk {
+		if inputOpts.ReadPreference != "" {
+			log.Logf(log.Always, "--slaveOk can't be specified when --readPreference is specified")
+			os.Exit(util.ExitBadOptions)
+		}
+		log.Logf(log.Always, "--slaveOk is deprecated and being internally rewritten as --readPreference=nearest")
+		inputOpts.ReadPreference = "nearest"
+	}
+
+	var mode mgo.Mode
+	if opts.ReplicaSetName != "" || isMongos {
+		mode = mgo.Primary
+	} else {
+		mode = mgo.Nearest
+	}
+	var tags bson.D
+	if inputOpts.ReadPreference != "" {
+		mode, tags, err = db.ParseReadPreference(inputOpts.ReadPreference)
+		if err != nil {
+			log.Logf(log.Always, "error parsing --ReadPreference: %v", err)
+			os.Exit(util.ExitBadOptions)
+		}
+		if len(tags) > 0 {
+			provider.SetTags(tags)
+		}
+	}
+
+	// warn if we are trying to export from a secondary in a sharded cluster
+	if isMongos && mode != mgo.Primary {
+		log.Logf(log.Always, db.WarningNonPrimaryMongosConnection)
+	}
+
+	provider.SetReadPreference(mode)
+
 	if err != nil {
 		log.Logf(log.Always, "error connecting to host: %v", err)
 		os.Exit(util.ExitError)

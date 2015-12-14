@@ -110,7 +110,7 @@ func (restore *MongoRestore) RestoreIntent(intent *intents.Intent) error {
 	var indexes []IndexDocument
 
 	// get indexes from system.indexes dump if we have it but don't have metadata files
-	if intent.MetadataPath == "" {
+	if intent.MetadataFile == nil {
 		if _, ok := restore.dbCollectionIndexes[intent.DB]; ok {
 			if indexes, ok = restore.dbCollectionIndexes[intent.DB][intent.C]; ok {
 				log.Logf(log.Always, "no metadata; falling back to system.indexes")
@@ -119,21 +119,21 @@ func (restore *MongoRestore) RestoreIntent(intent *intents.Intent) error {
 	}
 
 	// first create the collection with options from the metadata file
-	if intent.MetadataPath != "" {
+	if intent.MetadataFile != nil {
 		err = intent.MetadataFile.Open()
 		if err != nil {
 			return err
 		}
 		defer intent.MetadataFile.Close()
 
-		log.Logf(log.Always, "reading metadata for %v from %v", intent.Namespace(), intent.Location)
+		log.Logf(log.Always, "reading metadata for %v from %v", intent.Namespace(), intent.MetadataLocation)
 		metadata, err := ioutil.ReadAll(intent.MetadataFile)
 		if err != nil {
-			return fmt.Errorf("error reading metadata from %v: %v", intent.Location, err)
+			return fmt.Errorf("error reading metadata from %v: %v", intent.MetadataLocation, err)
 		}
 		options, indexes, err = restore.MetadataFromJSON(metadata)
 		if err != nil {
-			return fmt.Errorf("error parsing metadata from %v: %v", intent.Location, err)
+			return fmt.Errorf("error parsing metadata from %v: %v", intent.MetadataLocation, err)
 		}
 		if !restore.OutputOptions.NoOptionsRestore {
 			if options != nil {
@@ -155,7 +155,7 @@ func (restore *MongoRestore) RestoreIntent(intent *intents.Intent) error {
 	}
 
 	var documentCount int64
-	if intent.BSONPath != "" {
+	if intent.BSONFile != nil {
 		err = intent.BSONFile.Open()
 		if err != nil {
 			return err
@@ -167,9 +167,9 @@ func (restore *MongoRestore) RestoreIntent(intent *intents.Intent) error {
 		bsonSource := db.NewDecodedBSONSource(db.NewBSONSource(intent.BSONFile))
 		defer bsonSource.Close()
 
-		documentCount, err = restore.RestoreCollectionToDB(intent.DB, intent.C, bsonSource, intent.Size)
+		documentCount, err = restore.RestoreCollectionToDB(intent.DB, intent.C, bsonSource, intent.BSONFile, intent.Size)
 		if err != nil {
-			return fmt.Errorf("error restoring from %v: %v", intent.BSONPath, err)
+			return fmt.Errorf("error restoring from %v: %v", intent.Location, err)
 		}
 	}
 
@@ -192,7 +192,7 @@ func (restore *MongoRestore) RestoreIntent(intent *intents.Intent) error {
 // RestoreCollectionToDB pipes the given BSON data into the database.
 // Returns the number of documents restored and any errors that occured.
 func (restore *MongoRestore) RestoreCollectionToDB(dbName, colName string,
-	bsonSource *db.DecodedBSONSource, fileSize int64) (int64, error) {
+	bsonSource *db.DecodedBSONSource, file PosReader, fileSize int64) (int64, error) {
 
 	var termErr error
 	session, err := restore.SessionProvider.GetSession()
@@ -272,7 +272,7 @@ func (restore *MongoRestore) RestoreCollectionToDB(dbName, colName string,
 						log.Logf(log.Always, "error: %v", err)
 					}
 				}
-				watchProgressor.Inc(int64(len(rawDoc.Data)))
+				watchProgressor.Set(file.Pos())
 			}
 			err := bulk.Flush()
 			if err != nil {

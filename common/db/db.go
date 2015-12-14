@@ -3,13 +3,13 @@
 package db
 
 import (
-	"errors"
 	"fmt"
 	"github.com/mongodb/mongo-tools/common/options"
 	"github.com/mongodb/mongo-tools/common/password"
 	"gopkg.in/mgo.v2"
 	"gopkg.in/mgo.v2/bson"
 	"io"
+	"strings"
 	"sync"
 	"time"
 )
@@ -29,8 +29,7 @@ const (
 
 // MongoDB enforced limits.
 const (
-	MaxBSONSize    = 16 * 1024 * 1024     // 16MB - maximum BSON document size
-	MaxMessageSize = 2 * 16 * 1024 * 1024 // 32MB - maximum message size in wire protocol
+	MaxBSONSize = 16 * 1024 * 1024 // 16MB - maximum BSON document size
 )
 
 // Default port for integration tests
@@ -38,12 +37,18 @@ const (
 	DefaultTestPort = "33333"
 )
 
+const (
+	ErrLostConnection     = "lost connection to server"
+	ErrNoReachableServers = "no reachable servers"
+	ErrNsNotFound         = "ns not found"
+	// replication errors list the replset name if we are talking to a mongos,
+	// so we can only check for this universal prefix
+	ErrReplTimeoutPrefix = "waiting for replication timed out"
+)
+
 var (
-	ErrLostConnection     = errors.New("lost connection to server")
-	ErrNoReachableServers = errors.New("no reachable servers")
-	ErrNsNotFound         = errors.New("ns not found")
-	DefaultDialTimeout    = time.Second * 3
-	GetConnectorFuncs     = []GetConnectorFunc{}
+	DefaultDialTimeout = time.Second * 3
+	GetConnectorFuncs  = []GetConnectorFunc{}
 )
 
 // Used to manage database sessions
@@ -59,7 +64,9 @@ type SessionProvider struct {
 	masterSession *mgo.Session
 
 	// flags for generating the master session
-	flags sessionFlag
+	flags          sessionFlag
+	readPreference mgo.Mode
+	tags           bson.D
 }
 
 // ApplyOpsResponse represents the response from an 'applyOps' command.
@@ -75,8 +82,8 @@ type Oplog struct {
 	Version   int                 `bson:"v"`
 	Operation string              `bson:"op"`
 	Namespace string              `bson:"ns"`
-	Object    bson.M              `bson:"o"`
-	Query     bson.M              `bson:"o2"`
+	Object    bson.D              `bson:"o"`
+	Query     bson.D              `bson:"o2"`
 }
 
 // Returns a session connected to the database server for which the
@@ -98,25 +105,24 @@ func (self *SessionProvider) GetSession() (*mgo.Session, error) {
 	}
 
 	// update masterSession based on flags
-	self.refreshFlags()
+	self.refresh()
 
 	// copy the provider's master session, for connection pooling
 	return self.masterSession.Copy(), nil
 }
 
-// refreshFlags is a helper for modifying the session based on the
+// refresh is a helper for modifying the session based on the
 // session provider flags passed in with SetFlags.
 // This helper assumes a lock is already taken.
-func (self *SessionProvider) refreshFlags() {
-	// handle slaveOK
-	if (self.flags & Monotonic) > 0 {
-		self.masterSession.SetMode(mgo.Monotonic, true)
-	} else {
-		self.masterSession.SetMode(mgo.Strong, true)
-	}
+func (self *SessionProvider) refresh() {
+	// handle readPreference
+	self.masterSession.SetMode(self.readPreference, true)
 	// disable timeouts
 	if (self.flags & DisableSocketTimeout) > 0 {
 		self.masterSession.SetSocketTimeout(0)
+	}
+	if self.tags != nil {
+		self.masterSession.SelectServers(self.tags)
 	}
 }
 
@@ -129,7 +135,33 @@ func (self *SessionProvider) SetFlags(flagBits sessionFlag) {
 
 	// make sure we update the master session if one already exists
 	if self.masterSession != nil {
-		self.refreshFlags()
+		self.refresh()
+	}
+}
+
+// SetReadPreference sets the read preference mode in the SessionProvider
+// and eventually in the masterSession
+func (self *SessionProvider) SetReadPreference(pref mgo.Mode) {
+	self.masterSessionLock.Lock()
+	defer self.masterSessionLock.Unlock()
+
+	self.readPreference = pref
+
+	if self.masterSession != nil {
+		self.refresh()
+	}
+}
+
+// SetTags sets the server selection tags in the SessionProvider
+// and eventually in the masterSession
+func (self *SessionProvider) SetTags(tags bson.D) {
+	self.masterSessionLock.Lock()
+	defer self.masterSessionLock.Unlock()
+
+	self.tags = tags
+
+	if self.masterSession != nil {
+		self.refresh()
 	}
 }
 
@@ -137,7 +169,9 @@ func (self *SessionProvider) SetFlags(flagBits sessionFlag) {
 // create the initial session.
 func NewSessionProvider(opts options.ToolOptions) (*SessionProvider, error) {
 	// create the provider
-	provider := &SessionProvider{}
+	provider := &SessionProvider{
+		readPreference: mgo.Primary,
+	}
 
 	// finalize auth options, filling in missing passwords
 	if opts.Auth.ShouldAskForPassword() {
@@ -162,10 +196,8 @@ func IsConnectionError(err error) bool {
 	if err == nil {
 		return false
 	}
-	if err.Error() == ErrNoReachableServers.Error() {
-		return true
-	}
-	if err.Error() == io.EOF.Error() {
+	if err.Error() == ErrNoReachableServers || err.Error() == io.EOF.Error() ||
+		strings.HasPrefix(err.Error(), ErrReplTimeoutPrefix) {
 		return true
 	}
 	return false

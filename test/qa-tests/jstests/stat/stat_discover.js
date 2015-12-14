@@ -55,7 +55,7 @@ endTime = new Date();
 
 duration = Math.floor((endTime.valueOf() - startTime.valueOf()) / 1000);
 
-assert.eq(duration, 9, "sleep time affects the total time to produce a number or results");
+assert.gte(duration, 9, "sleep time affects the total time to produce a number or results");
 
 clearRawMongoProgramOutput();
 pid = startMongoProgramNoConnect("mongostat", "--host", rs.liveNodes.slaves[1].host, "--discover");
@@ -92,10 +92,21 @@ assert(statOutputPortCheck([ rs.liveNodes.slaves[0].port ]), "after discovered i
 
 rs.stop(rs.liveNodes.slaves[1]);
 
+assert.soon( function() {
+            try {
+                conn = new Mongo(rs.liveNodes.slaves[1].host);
+                return false;
+            } catch( e ) {
+                return true;
+            }
+            return false;
+}, "mongod still available after being stopped "+ rs.liveNodes.slaves[1].host);
+
+sleep(1000);
+
 clearRawMongoProgramOutput();
 
-sleep(15000)
-
+sleep(2000)
 
 assert(!statOutputPortCheck([ rs.liveNodes.slaves[1].port ]), "after specified host is stopped, specified host is not seen");
 

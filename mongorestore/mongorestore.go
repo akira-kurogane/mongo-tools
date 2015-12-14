@@ -190,6 +190,9 @@ func (restore *MongoRestore) Restore() error {
 		if err != nil {
 			return err
 		}
+		log.Logf(log.DebugLow, `archive format version "%v"`, restore.archive.Prelude.Header.FormatVersion)
+		log.Logf(log.DebugLow, `archive server version "%v"`, restore.archive.Prelude.Header.ServerVersion)
+		log.Logf(log.DebugLow, `archive tool version "%v"`, restore.archive.Prelude.Header.ToolVersion)
 		target, err = restore.archive.Prelude.NewPreludeExplorer()
 		if err != nil {
 			return err
@@ -368,17 +371,9 @@ func (restore *MongoRestore) Restore() error {
 
 	// Restore users/roles
 	if restore.ShouldRestoreUsersAndRoles() {
-		if restore.manager.Users() != nil {
-			err = restore.RestoreUsersOrRoles(Users, restore.manager.Users())
-			if err != nil {
-				return fmt.Errorf("restore error: %v", err)
-			}
-		}
-		if restore.manager.Roles() != nil {
-			err = restore.RestoreUsersOrRoles(Roles, restore.manager.Roles())
-			if err != nil {
-				return fmt.Errorf("restore error: %v", err)
-			}
+		err = restore.RestoreUsersOrRoles(restore.manager.Users(), restore.manager.Roles())
+		if err != nil {
+			return fmt.Errorf("restore error: %v", err)
 		}
 	}
 
@@ -445,9 +440,9 @@ func (restore *MongoRestore) getArchiveReader() (rc io.ReadCloser, err error) {
 // SIGHUP signal. It ends restore reads for all goroutines
 // as soon as any of those signals is received.
 func (restore *MongoRestore) handleSignals() {
-	log.Log(log.DebugLow, "will listen for SIGTERM, SIGINT and SIGHUP")
+	log.Log(log.DebugLow, "will listen for SIGTERM and SIGINT")
 	sigChan := make(chan os.Signal, 2)
-	signal.Notify(sigChan, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
+	signal.Notify(sigChan, syscall.SIGTERM, syscall.SIGINT)
 	// first signal cleanly terminates restore reads
 	<-sigChan
 	log.Log(log.Always, "ending restore reads")

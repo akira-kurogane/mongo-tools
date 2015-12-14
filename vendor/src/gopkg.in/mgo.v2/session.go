@@ -44,12 +44,23 @@ import (
 	"gopkg.in/mgo.v2/bson"
 )
 
-type mode int
+type Mode int
 
 const (
-	Eventual  mode = 0
-	Monotonic mode = 1
-	Strong    mode = 2
+	// Relevant documentation on read preference modes:
+	//
+	//     http://docs.mongodb.org/manual/reference/read-preference/
+	//
+	Primary            Mode = 2 // Default mode. All operations read from the current replica set primary.
+	PrimaryPreferred   Mode = 3 // Read from the primary if available. Read from the secondary otherwise.
+	Secondary          Mode = 4 // Read from one of the nearest secondary members of the replica set.
+	SecondaryPreferred Mode = 5 // Read from one of the nearest secondaries if available. Read from primary otherwise.
+	Nearest            Mode = 6 // Read from one of the nearest members, irrespective of it being primary or secondary.
+
+	// Read preference modes are specific to mgo:
+	Eventual  Mode = 0 // Same as Nearest, but may change servers between reads.
+	Monotonic Mode = 1 // Same as SecondaryPreferred before first write. Same as Primary after first write.
+	Strong    Mode = 2 // Same as Primary.
 )
 
 // When changing the Session type, check if newSession and copySession
@@ -61,7 +72,7 @@ type Session struct {
 	slaveSocket  *mongoSocket
 	masterSocket *mongoSocket
 	slaveOk      bool
-	consistency  mode
+	consistency  Mode
 	queryConfig  query
 	safeOp       *queryOp
 	syncTimeout  time.Duration
@@ -97,7 +108,7 @@ type query struct {
 }
 
 type getLastError struct {
-	CmdName  int         "getLastError"
+	CmdName  int         "getLastError,omitempty"
 	W        interface{} "w,omitempty"
 	WTimeout int         "wtimeout,omitempty"
 	FSync    bool        "fsync,omitempty"
@@ -218,7 +229,20 @@ func Dial(url string) (*Session, error) {
 //
 // See SetSyncTimeout for customizing the timeout for the session.
 func DialWithTimeout(url string, timeout time.Duration) (*Session, error) {
-	uinfo, err := parseURL(url)
+	info, err := ParseURL(url)
+	if err != nil {
+		return nil, err
+	}
+	info.Timeout = timeout
+	return DialWithInfo(info)
+}
+
+// ParseURL parses a MongoDB URL as accepted by the Dial function and returns
+// a value suitable for providing into DialWithInfo.
+//
+// See Dial for more details on the format of url.
+func ParseURL(url string) (*DialInfo, error) {
+	uinfo, err := extractURL(url)
 	if err != nil {
 		return nil, err
 	}
@@ -259,7 +283,6 @@ func DialWithTimeout(url string, timeout time.Duration) (*Session, error) {
 	info := DialInfo{
 		Addrs:          uinfo.addrs,
 		Direct:         direct,
-		Timeout:        timeout,
 		Database:       uinfo.db,
 		Username:       uinfo.user,
 		Password:       uinfo.pass,
@@ -269,7 +292,7 @@ func DialWithTimeout(url string, timeout time.Duration) (*Session, error) {
 		PoolLimit:      poolLimit,
 		ReplicaSetName: setName,
 	}
-	return DialWithInfo(&info)
+	return &info, nil
 }
 
 // DialInfo holds options for establishing a session with a MongoDB cluster.
@@ -428,7 +451,7 @@ type urlInfo struct {
 	options map[string]string
 }
 
-func parseURL(s string) (*urlInfo, error) {
+func extractURL(s string) (*urlInfo, error) {
 	if strings.HasPrefix(s, "mongodb://") {
 		s = s[10:]
 	}
@@ -469,7 +492,7 @@ func parseURL(s string) (*urlInfo, error) {
 	return info, nil
 }
 
-func newSession(consistency mode, cluster *mongoCluster, timeout time.Duration) (session *Session) {
+func newSession(consistency Mode, cluster *mongoCluster, timeout time.Duration) (session *Session) {
 	cluster.Acquire()
 	session = &Session{
 		cluster_:    cluster,
@@ -594,10 +617,14 @@ func (db *Database) GridFS(prefix string) *GridFS {
 //     http://www.mongodb.org/display/DOCS/List+of+Database+CommandSkips
 //
 func (db *Database) Run(cmd interface{}, result interface{}) error {
-	if name, ok := cmd.(string); ok {
-		cmd = bson.D{{name, 1}}
+	socket, err := db.Session.acquireSocket(true)
+	if err != nil {
+		return err
 	}
-	return db.C("$cmd").Find(cmd).One(result)
+	defer socket.Release()
+
+	// This is an optimized form of db.C("$cmd").Find(cmd).One(result).
+	return db.run(socket, cmd, result)
 }
 
 // Credential holds details to authenticate with a MongoDB server.
@@ -851,7 +878,7 @@ func (db *Database) UpsertUser(user *User) error {
 
 func isNoCmd(err error) bool {
 	e, ok := err.(*QueryError)
-	return ok && strings.HasPrefix(e.Message, "no such cmd:")
+	return ok && (e.Code == 59 || e.Code == 13390 || strings.HasPrefix(e.Message, "no such cmd:"))
 }
 
 func isNotFound(err error) bool {
@@ -943,15 +970,16 @@ func (db *Database) RemoveUser(user string) error {
 type indexSpec struct {
 	Name, NS         string
 	Key              bson.D
-	Unique           bool   ",omitempty"
-	DropDups         bool   "dropDups,omitempty"
-	Background       bool   ",omitempty"
-	Sparse           bool   ",omitempty"
-	Bits, Min, Max   int    ",omitempty"
-	ExpireAfter      int    "expireAfterSeconds,omitempty"
-	Weights          bson.D ",omitempty"
-	DefaultLanguage  string "default_language,omitempty"
-	LanguageOverride string "language_override,omitempty"
+	Unique           bool    ",omitempty"
+	DropDups         bool    "dropDups,omitempty"
+	Background       bool    ",omitempty"
+	Sparse           bool    ",omitempty"
+	Bits, Min, Max   int     ",omitempty"
+	BucketSize       float64 "bucketSize,omitempty"
+	ExpireAfter      int     "expireAfterSeconds,omitempty"
+	Weights          bson.D  ",omitempty"
+	DefaultLanguage  string  "default_language,omitempty"
+	LanguageOverride string  "language_override,omitempty"
 }
 
 type Index struct {
@@ -971,6 +999,7 @@ type Index struct {
 
 	// Properties for spatial indexes.
 	Bits, Min, Max int
+	BucketSize     float64
 
 	// Properties for text indexes.
 	DefaultLanguage  string
@@ -1166,6 +1195,7 @@ func (c *Collection) EnsureIndex(index Index) error {
 		Bits:             index.Bits,
 		Min:              index.Min,
 		Max:              index.Max,
+		BucketSize:       index.BucketSize,
 		ExpireAfter:      int(index.ExpireAfter / time.Second),
 		Weights:          keyInfo.weights,
 		DefaultLanguage:  index.DefaultLanguage,
@@ -1183,17 +1213,21 @@ NextField:
 		panic("weight provided for field that is not part of index key: " + name)
 	}
 
-	session = session.Clone()
-	defer session.Close()
-	session.SetMode(Strong, false)
-	session.EnsureSafe(&Safe{})
+	cloned := session.Clone()
+	defer cloned.Close()
+	cloned.SetMode(Strong, false)
+	cloned.EnsureSafe(&Safe{})
+	db := c.Database.With(cloned)
 
-	db := c.Database.With(session)
-	err = db.C("system.indexes").Insert(&spec)
+	// Try with a command first.
+	err = db.Run(bson.D{{"createIndexes", c.Name}, {"indexes", []indexSpec{spec}}}, nil)
+	if isNoCmd(err) {
+		// Command not yet supported. Insert into the indexes collection instead.
+		err = db.C("system.indexes").Insert(&spec)
+	}
 	if err == nil {
 		session.cluster().CacheIndex(cacheKey, true)
 	}
-	session.Close()
 	return err
 }
 
@@ -1466,7 +1500,7 @@ func (s *Session) Refresh() {
 // Shifting between Monotonic and Strong modes will keep a previously
 // reserved connection for the session unless refresh is true or the
 // connection is unsuitable (to a secondary server in a Strong session).
-func (s *Session) SetMode(consistency mode, refresh bool) {
+func (s *Session) SetMode(consistency Mode, refresh bool) {
 	s.m.Lock()
 	debugf("Session %p: setting mode %d with refresh=%v (master=%p, slave=%p)", s, consistency, refresh, s.masterSocket, s.slaveSocket)
 	s.consistency = consistency
@@ -1482,7 +1516,7 @@ func (s *Session) SetMode(consistency mode, refresh bool) {
 }
 
 // Mode returns the current consistency mode for the session.
-func (s *Session) Mode() mode {
+func (s *Session) Mode() Mode {
 	s.m.RLock()
 	mode := s.consistency
 	s.m.RUnlock()
@@ -2608,6 +2642,44 @@ func (q *Query) SetMaxScan(n int) *Query {
 	return q
 }
 
+// SetMaxTime constrains the query to stop after running for the specified time.
+//
+// When the time limit is reached MongoDB automatically cancels the query.
+// This can be used to efficiently prevent and identify unexpectedly slow queries.
+//
+// A few important notes about the mechanism enforcing this limit:
+//
+//  - Requests can block behind locking operations on the server, and that blocking
+//    time is not accounted for. In other words, the timer starts ticking only after
+//    the actual start of the query when it initially acquires the appropriate lock;
+//
+//  - Operations are interrupted only at interrupt points where an operation can be
+//    safely aborted – the total execution time may exceed the specified value;
+//
+//  - The limit can be applied to both CRUD operations and commands, but not all
+//    commands are interruptible;
+//
+//  - While iterating over results, computing follow up batches is included in the
+//    total time and the iteration continues until the alloted time is over, but
+//    network roundtrips are not taken into account for the limit.
+//
+//  - This limit does not override the inactive cursor timeout for idle cursors
+//    (default is 10 min).
+//
+// This mechanism was introduced in MongoDB 2.6.
+//
+// Relevant documentation:
+//
+//   http://blog.mongodb.org/post/83621787773/maxtimems-and-query-optimizer-introspection-in
+//
+func (q *Query) SetMaxTime(d time.Duration) *Query {
+	q.m.Lock()
+	q.op.options.MaxTimeMS = int(d / time.Millisecond)
+	q.op.hasOptions = true
+	q.m.Unlock()
+	return q
+}
+
 // Snapshot will force the performed query to make use of an available
 // index on the _id field to prevent the same document from being returned
 // more than once in a single iteration. This might happen without this
@@ -2634,6 +2706,22 @@ func (q *Query) SetMaxScan(n int) *Query {
 func (q *Query) Snapshot() *Query {
 	q.m.Lock()
 	q.op.options.Snapshot = true
+	q.op.hasOptions = true
+	q.m.Unlock()
+	return q
+}
+
+// Comment adds a comment to the query to identify it in the database profiler output.
+//
+// Relevant documentation:
+//
+//     http://docs.mongodb.org/manual/reference/operator/meta/comment
+//     http://docs.mongodb.org/manual/reference/command/profile
+//     http://docs.mongodb.org/manual/administration/analyzing-mongodb-performance/#database-profiling
+//
+func (q *Query) Comment(comment string) *Query {
+	q.m.Lock()
+	q.op.options.Comment = comment
 	q.op.hasOptions = true
 	q.m.Unlock()
 	return q
@@ -2712,7 +2800,7 @@ func (q *Query) One(result interface{}) (err error) {
 	}
 	defer socket.Release()
 
-	op.flags |= session.slaveOkFlag()
+	session.prepareQuery(&op)
 	op.limit = -1
 
 	data, err := socket.SimpleQuery(&op)
@@ -2728,6 +2816,48 @@ func (q *Query) One(result interface{}) (err error) {
 			debugf("Query %p document unmarshaled: %#v", q, result)
 		} else {
 			debugf("Query %p document unmarshaling failed: %#v", q, err)
+			return err
+		}
+	}
+	return checkQueryError(op.collection, data)
+}
+
+// run duplicates the behavior of collection.Find(query).One(&result)
+// as performed by Database.Run, specializing the logic for running
+// database commands on a given socket.
+func (db *Database) run(socket *mongoSocket, cmd, result interface{}) (err error) {
+	// Database.Run:
+	if name, ok := cmd.(string); ok {
+		cmd = bson.D{{name, 1}}
+	}
+
+	// Collection.Find:
+	session := db.Session
+	session.m.RLock()
+	op := session.queryConfig.op // Copy.
+	session.m.RUnlock()
+	op.query = cmd
+	op.collection = db.Name + ".$cmd"
+
+	// Query.One:
+	session.prepareQuery(&op)
+	op.limit = -1
+
+	data, err := socket.SimpleQuery(&op)
+	if err != nil {
+		return err
+	}
+	if data == nil {
+		return ErrNotFound
+	}
+	if result != nil {
+		err = bson.Unmarshal(data, result)
+		if err == nil {
+			var res bson.M
+			bson.Unmarshal(data, &res)
+			debugf("Run command unmarshaled: %#v, result: %#v", op, res)
+		} else {
+			debugf("Run command unmarshaling failed: %#v", op, err)
 			return err
 		}
 	}
@@ -2903,8 +3033,9 @@ func (q *Query) Iter() *Iter {
 	iter.op.limit = op.limit
 	iter.op.replyFunc = iter.replyFunc()
 	iter.docsToReceive++
+
+	session.prepareQuery(&op)
 	op.replyFunc = iter.op.replyFunc
-	op.flags |= session.slaveOkFlag()
 
 	socket, err := session.acquireSocket(true)
 	if err != nil {
@@ -2984,8 +3115,9 @@ func (q *Query) Tail(timeout time.Duration) *Iter {
 	iter.op.limit = op.limit
 	iter.op.replyFunc = iter.replyFunc()
 	iter.docsToReceive++
+	session.prepareQuery(&op)
 	op.replyFunc = iter.op.replyFunc
-	op.flags |= flagTailable | flagAwaitData | session.slaveOkFlag()
+	op.flags |= flagTailable | flagAwaitData
 
 	socket, err := session.acquireSocket(true)
 	if err != nil {
@@ -3004,10 +3136,11 @@ func (q *Query) Tail(timeout time.Duration) *Iter {
 	return iter
 }
 
-func (s *Session) slaveOkFlag() (flag queryOpFlags) {
+func (s *Session) prepareQuery(op *queryOp) {
 	s.m.RLock()
+	op.mode = s.consistency
 	if s.slaveOk {
-		flag = flagSlaveOk
+		op.flags |= flagSlaveOk
 	}
 	s.m.RUnlock()
 	return
@@ -3379,9 +3512,7 @@ type distinctCmd struct {
 	Query      interface{} ",omitempty"
 }
 
-// Distinct returns a list of distinct values for the given key within
-// the result set.  The list of distinct values will be unmarshalled
-// in the "values" key of the provided result parameter.
+// Distinct unmarshals into result the list of distinct values for the given key.
 //
 // For example:
 //
@@ -3712,7 +3843,7 @@ func (q *Query) Apply(change Change, result interface{}) (info *ChangeInfo, err 
 	if doc.LastError.N == 0 {
 		return nil, ErrNotFound
 	}
-	if doc.Value.Kind != 0x0A {
+	if doc.Value.Kind != 0x0A && result != nil {
 		err = doc.Value.Unmarshal(result)
 		if err != nil {
 			return nil, err
@@ -3792,14 +3923,16 @@ func (s *Session) acquireSocket(slaveOk bool) (*mongoSocket, error) {
 
 	// Read-only lock to check for previously reserved socket.
 	s.m.RLock()
-	if s.masterSocket != nil {
-		socket := s.masterSocket
+	// If there is a slave socket reserved and its use is acceptable, take it as long
+	// as there isn't a master socket which would be preferred by the read preference mode.
+	if s.slaveSocket != nil && s.slaveOk && slaveOk && (s.masterSocket == nil || s.consistency != PrimaryPreferred && s.consistency != Monotonic) {
+		socket := s.slaveSocket
 		socket.Acquire()
 		s.m.RUnlock()
 		return socket, nil
 	}
-	if s.slaveSocket != nil && s.slaveOk && slaveOk {
-		socket := s.slaveSocket
+	if s.masterSocket != nil {
+		socket := s.masterSocket
 		socket.Acquire()
 		s.m.RUnlock()
 		return socket, nil
@@ -3811,17 +3944,17 @@ func (s *Session) acquireSocket(slaveOk bool) (*mongoSocket, error) {
 	s.m.Lock()
 	defer s.m.Unlock()
 
+	if s.slaveSocket != nil && s.slaveOk && slaveOk && (s.masterSocket == nil || s.consistency != PrimaryPreferred && s.consistency != Monotonic) {
+		s.slaveSocket.Acquire()
+		return s.slaveSocket, nil
+	}
 	if s.masterSocket != nil {
 		s.masterSocket.Acquire()
 		return s.masterSocket, nil
 	}
-	if s.slaveSocket != nil && s.slaveOk && slaveOk {
-		s.slaveSocket.Acquire()
-		return s.slaveSocket, nil
-	}
 
 	// Still not good.  We need a new socket.
-	sock, err := s.cluster().AcquireSocket(slaveOk && s.slaveOk, s.syncTimeout, s.sockTimeout, s.queryConfig.op.serverTags, s.poolLimit)
+	sock, err := s.cluster().AcquireSocket(s.consistency, slaveOk && s.slaveOk, s.syncTimeout, s.sockTimeout, s.queryConfig.op.serverTags, s.poolLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -3916,6 +4049,27 @@ func (iter *Iter) replyFunc() replyFunc {
 	}
 }
 
+type writeCmdResult struct {
+	Ok        bool
+	N         int
+	NModified int `bson:"nModified"`
+	Upserted  []struct {
+		Index int
+		Id    interface{} `_id`
+	}
+	Errors []struct {
+		Ok     bool
+		Index  int
+		Code   int
+		N      int
+		ErrMsg string
+	} `bson:"writeErrors"`
+	ConcernError struct {
+		Code   int
+		ErrMsg string
+	} `bson:"writeConcernError"`
+}
+
 // writeQuery runs the given modifying operation, potentially followed up
 // by a getLastError command in case the session is in safe mode.  The
 // LastError result is made available in lerr, and if lerr.Err is set it
@@ -3933,44 +4087,146 @@ func (c *Collection) writeQuery(op interface{}) (lerr *LastError, err error) {
 	safeOp := s.safeOp
 	s.m.RUnlock()
 
+	// TODO Enable this path for wire version 2 as well.
+	if socket.ServerInfo().MaxWireVersion >= 3 {
+		// Servers with a more recent write protocol benefit from write commands.
+		if op, ok := op.(*insertOp); ok && len(op.documents) > 1000 {
+			var firstErr error
+			// Maximum batch size is 1000. Must split out in separate operations for compatibility.
+			all := op.documents
+			for i := 0; i < len(all); i += 1000 {
+				l := i + 1000
+				if l > len(all) {
+					l = len(all)
+				}
+				op.documents = all[i:l]
+				_, err := c.writeCommand(socket, safeOp, op)
+				if err != nil {
+					if op.flags&1 != 0 {
+						if firstErr == nil {
+							firstErr = err
+						}
+					} else {
+						return nil, err
+					}
+				}
+			}
+			return nil, firstErr
+		}
+		return c.writeCommand(socket, safeOp, op)
+	}
+
 	if safeOp == nil {
 		return nil, socket.Query(op)
-	} else {
-		var mutex sync.Mutex
-		var replyData []byte
-		var replyErr error
-		mutex.Lock()
-		query := *safeOp // Copy the data.
-		query.collection = dbname + ".$cmd"
-		query.replyFunc = func(err error, reply *replyOp, docNum int, docData []byte) {
-			replyData = docData
-			replyErr = err
-			mutex.Unlock()
-		}
-		err = socket.Query(op, &query)
+	}
+
+	var mutex sync.Mutex
+	var replyData []byte
+	var replyErr error
+	mutex.Lock()
+	query := *safeOp // Copy the data.
+	query.collection = dbname + ".$cmd"
+	query.replyFunc = func(err error, reply *replyOp, docNum int, docData []byte) {
+		replyData = docData
+		replyErr = err
+		mutex.Unlock()
+	}
+	err = socket.Query(op, &query)
+	if err != nil {
+		return nil, err
+	}
+	mutex.Lock() // Wait.
+	if replyErr != nil {
+		return nil, replyErr // XXX TESTME
+	}
+	if hasErrMsg(replyData) {
+		// Looks like getLastError itself failed.
+		err = checkQueryError(query.collection, replyData)
 		if err != nil {
 			return nil, err
 		}
-		mutex.Lock() // Wait.
-		if replyErr != nil {
-			return nil, replyErr // XXX TESTME
-		}
-		if hasErrMsg(replyData) {
-			// Looks like getLastError itself failed.
-			err = checkQueryError(query.collection, replyData)
-			if err != nil {
-				return nil, err
-			}
-		}
-		result := &LastError{}
-		bson.Unmarshal(replyData, &result)
-		debugf("Result from writing query: %#v", result)
-		if result.Err != "" {
-			return result, result
-		}
-		return result, nil
 	}
-	panic("unreachable")
+	result := &LastError{}
+	bson.Unmarshal(replyData, &result)
+	debugf("Result from writing query: %#v", result)
+	if result.Err != "" {
+		return result, result
+	}
+	return result, nil
+}
+
+func (c *Collection) writeCommand(socket *mongoSocket, safeOp *queryOp, op interface{}) (lerr *LastError, err error) {
+	var writeConcern interface{}
+	if safeOp == nil {
+		writeConcern = bson.D{{"w", 0}}
+	} else {
+		writeConcern = safeOp.query.(*getLastError)
+	}
+
+	var cmd bson.D
+	switch op := op.(type) {
+	case *insertOp:
+		// http://docs.mongodb.org/manual/reference/command/insert
+		cmd = bson.D{
+			{"insert", c.Name},
+			{"documents", op.documents},
+			{"writeConcern", writeConcern},
+			{"ordered", op.flags&1 == 0},
+		}
+	case *updateOp:
+		// http://docs.mongodb.org/manual/reference/command/update
+		selector := op.selector
+		if selector == nil {
+			selector = bson.D{}
+		}
+		cmd = bson.D{
+			{"update", c.Name},
+			{"updates", []bson.D{{{"q", selector}, {"u", op.update}, {"upsert", op.flags&1 != 0}, {"multi", op.flags&2 != 0}}}},
+			{"writeConcern", writeConcern},
+			//{"ordered", <bool>},
+		}
+	case *deleteOp:
+		// http://docs.mongodb.org/manual/reference/command/delete
+		selector := op.selector
+		if selector == nil {
+			selector = bson.D{}
+		}
+		cmd = bson.D{
+			{"delete", c.Name},
+			{"deletes", []bson.D{{{"q", selector}, {"limit", op.flags & 1}}}},
+			{"writeConcern", writeConcern},
+			//{"ordered", <bool>},
+		}
+	}
+
+	var result writeCmdResult
+	err = c.Database.run(socket, cmd, &result)
+	debugf("Write command result: %#v (err=%v)", result, err)
+	lerr = &LastError{
+		UpdatedExisting: result.N > 0 && len(result.Upserted) == 0,
+		N:               result.N,
+	}
+	if len(result.Upserted) > 0 {
+		lerr.UpsertedId = result.Upserted[0].Id
+	}
+	if len(result.Errors) > 0 {
+		e := result.Errors[0]
+		if !e.Ok {
+			lerr.Code = e.Code
+			lerr.Err = e.ErrMsg
+			err = lerr
+		}
+	} else if result.ConcernError.Code != 0 {
+		e := result.ConcernError
+		lerr.Code = e.Code
+		lerr.Err = e.ErrMsg
+		err = lerr
+	}
+
+	if err == nil && safeOp == nil {
+		return nil, nil
+	}
+	return lerr, err
 }
 
 func hasErrMsg(d []byte) bool {
