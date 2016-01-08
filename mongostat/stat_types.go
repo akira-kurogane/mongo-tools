@@ -461,15 +461,12 @@ func (jlf *JSONLineFormatter) FormatLines(lines []StatLine, index int, discover 
 		lineJson["host"] = line.Host
 		lineJson["vsize"] = text.FormatMegabyteAmount(int64(line.Virtual))
 		lineJson["res"] = text.FormatMegabyteAmount(int64(line.Resident))
-
+		lineJson["flushes"] = fmt.Sprintf("%v", line.Flushes)
+		lineJson["qr|qw"] = fmt.Sprintf("%v|%v", line.QueuedReaders, line.QueuedWriters)
+		lineJson["ar|aw"] = fmt.Sprintf("%v|%v", line.ActiveReaders, line.ActiveWriters)
+				
 		// add mmapv1-specific fields
 		if lineFlags&MMAPOnly > 0 {
-			lineJson["flushes"] = fmt.Sprintf("%v", line.Flushes)
-			lineJson["qr|qw"] = fmt.Sprintf("%v|%v", line.QueuedReaders,
-				line.QueuedWriters)
-			lineJson["ar|aw"] = fmt.Sprintf("%v|%v", line.ActiveReaders,
-				line.ActiveWriters)
-
 			mappedVal := ""      // empty for mongos
 			if line.Mapped > 0 { // not mongos, update accordingly
 				mappedVal = text.FormatMegabyteAmount(int64(line.Mapped))
@@ -735,12 +732,12 @@ func (glf *GridLineFormatter) FormatLines(lines []StatLine, index int, discover 
 	return returnVal
 }
 
-func diff(newVal, oldVal, sampleTime int64) int64 {
-	return (newVal - oldVal) / sampleTime
+func diff(newVal, oldVal int64, sampleSecs float64) int64 {
+	return int64(float64(newVal-oldVal) / sampleSecs)
 }
 
 // NewStatLine constructs a StatLine object from two ServerStatus objects.
-func NewStatLine(oldStat, newStat ServerStatus, key string, all bool, sampleSecs int64) *StatLine {
+func NewStatLine(oldStat, newStat ServerStatus, key string, all bool) *StatLine {
 	returnVal := &StatLine{
 		Key:       key,
 		Host:      newStat.Host,
@@ -757,6 +754,9 @@ func NewStatLine(oldStat, newStat ServerStatus, key string, all bool, sampleSecs
 	} else {
 		returnVal.StorageEngine = "mmapv1"
 	}
+
+	// Find the number of seconds that have elapsed since the last sample.
+	sampleSecs := float64(newStat.SampleTime.Sub(oldStat.SampleTime).Seconds())
 
 	if newStat.Opcounters != nil && oldStat.Opcounters != nil {
 		returnVal.Insert = diff(newStat.Opcounters.Insert, oldStat.Opcounters.Insert, sampleSecs)

@@ -14,9 +14,12 @@
   });
 
   rs.startSet();
-  rs.initiate();
+  var cfg = rs.getReplSetConfig();
+  cfg.settings = {};
+  cfg.settings.chainingAllowed = false;
+  rs.initiate(cfg);
   rs.awaitReplication();
-  toolTest.port = rs.getMaster().port;
+  toolTest.port = rs.getPrimary().port;
   var dbOne = rs.nodes[0].getDB("dbOne");
 
   function writeConcernTestFunc(exitCode, writeConcern, name) {
@@ -34,7 +37,7 @@
 
   function noConnectTest() {
     return startMongoProgramNoConnect.apply(null,
-        ['mongofiles', '-d', 'dbOne', '--writeConcern={w:3}','--host', rs.getMaster().host].
+        ['mongofiles', '-d', 'dbOne', '--writeConcern={w:3}','--host', rs.getPrimary().host].
         concat(commonToolArgs).
         concat(['put', 'jstests/files/testdata/files1.txt'])
         );
