@@ -3,20 +3,22 @@ package archive
 import (
 	"bytes"
 	"fmt"
+	"io"
+	"path/filepath"
+	"sync/atomic"
+
+	"github.com/mongodb/mongo-tools/common"
 	"github.com/mongodb/mongo-tools/common/intents"
 	"github.com/mongodb/mongo-tools/common/log"
 	"github.com/mongodb/mongo-tools/common/options"
 	"gopkg.in/mgo.v2/bson"
-	"io"
-	"path/filepath"
-	"sync/atomic"
 )
 
 //MetadataFile implements intents.file
 type MetadataFile struct {
+	pos int64 // updated atomically, aligned at the beginning of the struct
 	*bytes.Buffer
 	Intent *intents.Intent
-	pos    int64
 }
 
 func (md *MetadataFile) Open() error {
@@ -85,13 +87,13 @@ func (prelude *Prelude) Read(in io.Reader) error {
 }
 
 // NewPrelude generates a Prelude using the contents of an intent.Manager.
-func NewPrelude(manager *intents.Manager, maxProcs int, serverVersion string) (*Prelude, error) {
+func NewPrelude(manager *intents.Manager, concurrentColls int, serverVersion string) (*Prelude, error) {
 	prelude := Prelude{
 		Header: &Header{
 			FormatVersion:         archiveFormatVersion,
 			ServerVersion:         serverVersion,
 			ToolVersion:           options.VersionStr,
-			ConcurrentCollections: int32(maxProcs),
+			ConcurrentCollections: int32(concurrentColls),
 		},
 		NamespaceMetadatasByDB: make(map[string][]*CollectionMetadata, 0),
 	}
@@ -128,7 +130,7 @@ func (prelude *Prelude) AddMetadata(cm *CollectionMetadata) {
 		prelude.DBS = append(prelude.DBS, cm.Database)
 	}
 	prelude.NamespaceMetadatasByDB[cm.Database] = append(prelude.NamespaceMetadatasByDB[cm.Database], cm)
-	log.Logf(log.Info, "archive prelude %v.%v", cm.Database, cm.Collection)
+	log.Logvf(log.Info, "archive prelude %v.%v", cm.Database, cm.Collection)
 }
 
 // Write writes the archive header.
@@ -343,28 +345,27 @@ func (pe *PreludeExplorer) Parent() DirLike {
 
 // MetadataPreludeFile is part of the intents.file. It allows the metadata contained in the prelude to be opened and read
 type MetadataPreludeFile struct {
+	pos     int64 // updated atomically, aligned at the beginning of the struct
 	Intent  *intents.Intent
+	Origin  string
 	Prelude *Prelude
 	*bytes.Buffer
-	pos int64
 }
 
 // Open is part of the intents.file interface, it finds the metadata in the prelude and creates a bytes.Buffer from it.
 func (mpf *MetadataPreludeFile) Open() error {
-	if mpf.Intent.C == "" {
-		return fmt.Errorf("so such file") // what's the errno that occurs when one tries to open a directory
-	}
-	dbMetadatas, ok := mpf.Prelude.NamespaceMetadatasByDB[mpf.Intent.DB]
+	db, c := common.SplitNamespace(mpf.Origin)
+	dbMetadatas, ok := mpf.Prelude.NamespaceMetadatasByDB[db]
 	if !ok {
-		return fmt.Errorf("so such file") // what's the errno that occurs when one tries to open a directory
+		return fmt.Errorf("no metadata found for '%s'", db)
 	}
 	for _, metadata := range dbMetadatas {
-		if metadata.Collection == mpf.Intent.C {
+		if metadata.Collection == c {
 			mpf.Buffer = bytes.NewBufferString(metadata.Metadata)
 			return nil
 		}
 	}
-	return fmt.Errorf("so such file") // what's the errno that occurs when one tries to open a directory
+	return fmt.Errorf("no matching metadata found for '%s'", mpf.Origin)
 }
 
 // Close is part of the intents.file interface.

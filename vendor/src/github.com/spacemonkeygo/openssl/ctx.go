@@ -27,6 +27,14 @@ static long SSL_CTX_set_options_not_a_macro(SSL_CTX* ctx, long options) {
    return SSL_CTX_set_options(ctx, options);
 }
 
+static long SSL_CTX_clear_options_not_a_macro(SSL_CTX* ctx, long options) {
+   return SSL_CTX_clear_options(ctx, options);
+}
+
+static long SSL_CTX_get_options_not_a_macro(SSL_CTX* ctx) {
+   return SSL_CTX_get_options(ctx);
+}
+
 static long SSL_CTX_set_mode_not_a_macro(SSL_CTX* ctx, long modes) {
    return SSL_CTX_set_mode(ctx, modes);
 }
@@ -39,12 +47,33 @@ static long SSL_CTX_set_session_cache_mode_not_a_macro(SSL_CTX* ctx, long modes)
    return SSL_CTX_set_session_cache_mode(ctx, modes);
 }
 
+static long SSL_CTX_sess_set_cache_size_not_a_macro(SSL_CTX* ctx, long t) {
+	return SSL_CTX_sess_set_cache_size(ctx, t);
+}
+
+static long SSL_CTX_sess_get_cache_size_not_a_macro(SSL_CTX* ctx) {
+	return SSL_CTX_sess_get_cache_size(ctx);
+}
+
+static long SSL_CTX_set_timeout_not_a_macro(SSL_CTX* ctx, long t) {
+   return SSL_CTX_set_timeout(ctx, t);
+}
+
+static long SSL_CTX_get_timeout_not_a_macro(SSL_CTX* ctx) {
+   return SSL_CTX_get_timeout(ctx);
+}
+
 static int CRYPTO_add_not_a_macro(int *pointer,int amount,int type) {
    return CRYPTO_add(pointer, amount, type);
 }
 
 static long SSL_CTX_add_extra_chain_cert_not_a_macro(SSL_CTX* ctx, X509 *cert) {
     return SSL_CTX_add_extra_chain_cert(ctx, cert);
+}
+
+static long SSL_CTX_set_tlsext_servername_callback_not_a_macro(
+		SSL_CTX* ctx, int (*cb)(SSL *con, int *ad, void *args)) {
+	return SSL_CTX_set_tlsext_servername_callback(ctx, cb);
 }
 
 #ifndef SSL_MODE_RELEASE_BUFFERS
@@ -55,21 +84,9 @@ static long SSL_CTX_add_extra_chain_cert_not_a_macro(SSL_CTX* ctx, X509 *cert) {
 #define SSL_OP_NO_COMPRESSION 0
 #endif
 
-static const SSL_METHOD *OUR_TLSv1_1_method() {
-#ifdef TLS1_1_VERSION
-    return TLSv1_1_method();
-#else
-    return NULL;
+#if defined SSL_CTRL_SET_TLSEXT_HOSTNAME
+	extern int sni_cb(SSL *ssl_conn, int *ad, void *arg);
 #endif
-}
-
-static const SSL_METHOD *OUR_TLSv1_2_method() {
-#ifdef TLS1_2_VERSION
-    return TLSv1_2_method();
-#else
-    return NULL;
-#endif
-}
 
 extern int verify_cb(int ok, X509_STORE_CTX* store);
 
@@ -89,6 +106,8 @@ import (
 	"io/ioutil"
 	"os"
 	"runtime"
+	"sync"
+	"time"
 	"unsafe"
 
 	"github.com/spacemonkeygo/spacelog"
@@ -102,7 +121,14 @@ var (
 
 type Ctx struct {
 	ctx       *C.SSL_CTX
+	cert      *Certificate
+	chain     []*Certificate
+	key       PrivateKey
 	verify_cb VerifyCallback
+	sni_cb    TLSExtServernameCallback
+
+	ticket_store_mu sync.Mutex
+	ticket_store    *TicketStore
 }
 
 //export get_ssl_ctx_idx
@@ -128,10 +154,13 @@ func newCtx(method *C.SSL_METHOD) (*Ctx, error) {
 type SSLVersion int
 
 const (
-	SSLv3      SSLVersion = 0x02
-	TLSv1      SSLVersion = 0x03
-	TLSv1_1    SSLVersion = 0x04
-	TLSv1_2    SSLVersion = 0x05
+	SSLv3   SSLVersion = 0x02 // Vulnerable to "POODLE" attack.
+	TLSv1   SSLVersion = 0x03
+	TLSv1_1 SSLVersion = 0x04
+	TLSv1_2 SSLVersion = 0x05
+
+	// Make sure to disable SSLv2 and SSLv3 if you use this. SSLv3 is vulnerable
+	// to the "POODLE" attack, and SSLv2 is what, just don't even.
 	AnyVersion SSLVersion = 0x06
 )
 
@@ -140,14 +169,8 @@ const (
 func NewCtxWithVersion(version SSLVersion) (*Ctx, error) {
 	var method *C.SSL_METHOD
 	switch version {
-	case SSLv3:
-		method = C.SSLv3_method()
 	case TLSv1:
 		method = C.TLSv1_method()
-	case TLSv1_1:
-		method = C.OUR_TLSv1_1_method()
-	case TLSv1_2:
-		method = C.OUR_TLSv1_2_method()
 	case AnyVersion:
 		method = C.SSLv23_method()
 	}
@@ -179,7 +202,12 @@ func NewCtxFromFiles(cert_file string, key_file string) (*Ctx, error) {
 		return nil, err
 	}
 
-	cert, err := LoadCertificateFromPEM(cert_bytes)
+	certs := SplitPEM(cert_bytes)
+	if len(certs) == 0 {
+		return nil, fmt.Errorf("No PEM certificate found in '%s'", cert_file)
+	}
+	first, certs := certs[0], certs[1:]
+	cert, err := LoadCertificateFromPEM(first)
 	if err != nil {
 		return nil, err
 	}
@@ -187,6 +215,17 @@ func NewCtxFromFiles(cert_file string, key_file string) (*Ctx, error) {
 	err = ctx.UseCertificate(cert)
 	if err != nil {
 		return nil, err
+	}
+
+	for _, pem := range certs {
+		cert, err := LoadCertificateFromPEM(pem)
+		if err != nil {
+			return nil, err
+		}
+		err = ctx.AddChainCertificate(cert)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	key_bytes, err := ioutil.ReadFile(key_file)
@@ -223,6 +262,7 @@ const (
 func (c *Ctx) UseCertificate(cert *Certificate) error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
+	c.cert = cert
 	if int(C.SSL_CTX_use_certificate(c.ctx, cert.x)) != 1 {
 		return errorFromErrorQueue()
 	}
@@ -345,9 +385,12 @@ func (c *Ctx) SetClientCAList(caList *StackOfX509Name) {
 func (c *Ctx) AddChainCertificate(cert *Certificate) error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
+	c.chain = append(c.chain, cert)
 	if int(C.SSL_CTX_add_extra_chain_cert_not_a_macro(c.ctx, cert.x)) != 1 {
 		return errorFromErrorQueue()
 	}
+	// OpenSSL takes ownership via SSL_CTX_add_extra_chain_cert
+	runtime.SetFinalizer(cert, nil)
 	return nil
 }
 
@@ -356,6 +399,7 @@ func (c *Ctx) AddChainCertificate(cert *Certificate) error {
 func (c *Ctx) UsePrivateKey(key PrivateKey) error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
+	c.key = key
 	if int(C.SSL_CTX_use_PrivateKey(c.ctx, key.evpPKey())) != 1 {
 		return errorFromErrorQueue()
 	}
@@ -364,7 +408,38 @@ func (c *Ctx) UsePrivateKey(key PrivateKey) error {
 
 type CertificateStore struct {
 	store *C.X509_STORE
-	ctx   *Ctx // for gc
+	// for GC
+	ctx   *Ctx
+	certs []*Certificate
+}
+
+// Allocate a new, empty CertificateStore
+func NewCertificateStore() (*CertificateStore, error) {
+	s := C.X509_STORE_new()
+	if s == nil {
+		return nil, errors.New("failed to allocate X509_STORE")
+	}
+	store := &CertificateStore{store: s}
+	runtime.SetFinalizer(store, func(s *CertificateStore) {
+		C.X509_STORE_free(s.store)
+	})
+	return store, nil
+}
+
+// Parse a chained PEM file, loading all certificates into the Store.
+func (s *CertificateStore) LoadCertificatesFromPEM(data []byte) error {
+	pems := SplitPEM(data)
+	for _, pem := range pems {
+		cert, err := LoadCertificateFromPEM(pem)
+		if err != nil {
+			return err
+		}
+		err = s.AddCertificate(cert)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // GetCertificateStore returns the context's certificate store that will be
@@ -382,6 +457,7 @@ func (c *Ctx) GetCertificateStore() *CertificateStore {
 func (s *CertificateStore) AddCertificate(cert *Certificate) error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
+	s.certs = append(s.certs, cert)
 	if int(C.X509_STORE_add_cert(s.store, cert.x)) != 1 {
 		return errorFromErrorQueue()
 	}
@@ -480,6 +556,10 @@ type CertificateStoreCtx struct {
 	ssl_ctx *Ctx
 }
 
+func (self *CertificateStoreCtx) VerifyResult() VerifyResult {
+	return VerifyResult(C.X509_STORE_CTX_get_error(self.ctx))
+}
+
 func (self *CertificateStoreCtx) Err() error {
 	code := C.X509_STORE_CTX_get_error(self.ctx)
 	if code == C.X509_V_OK {
@@ -543,6 +623,7 @@ const (
 	NoTLSv1                            Options = C.SSL_OP_NO_TLSv1
 	CipherServerPreference             Options = C.SSL_OP_CIPHER_SERVER_PREFERENCE
 	NoSessionResumptionOrRenegotiation Options = C.SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION
+	NoTicket                           Options = C.SSL_OP_NO_TICKET
 	OpAll                              Options = C.SSL_OP_ALL
 )
 
@@ -551,6 +632,17 @@ const (
 func (c *Ctx) SetOptions(options Options) Options {
 	return Options(C.SSL_CTX_set_options_not_a_macro(
 		c.ctx, C.long(options)))
+}
+
+func (c *Ctx) ClearOptions(options Options) Options {
+	return Options(C.SSL_CTX_clear_options_not_a_macro(
+		c.ctx, C.long(options)))
+}
+
+// GetOptions returns context options. See
+// https://www.openssl.org/docs/ssl/SSL_CTX_set_options.html
+func (c *Ctx) GetOptions() Options {
+	return Options(C.SSL_CTX_get_options_not_a_macro(c.ctx))
 }
 
 type Modes int
@@ -631,6 +723,10 @@ func (c *Ctx) SetVerifyCallback(verify_cb VerifyCallback) {
 	c.SetVerify(c.VerifyMode(), verify_cb)
 }
 
+func (c *Ctx) GetVerifyCallback() VerifyCallback {
+	return c.verify_cb
+}
+
 func (c *Ctx) VerifyMode() VerifyOptions {
 	return VerifyOptions(C.SSL_CTX_get_verify_mode(c.ctx))
 }
@@ -640,6 +736,23 @@ func (c *Ctx) VerifyMode() VerifyOptions {
 // https://www.openssl.org/docs/ssl/SSL_CTX_set_verify.html
 func (c *Ctx) SetVerifyDepth(depth int) {
 	C.SSL_CTX_set_verify_depth(c.ctx, C.int(depth))
+}
+
+// GetVerifyDepth controls how many certificates deep the certificate
+// verification logic is willing to follow a certificate chain. See
+// https://www.openssl.org/docs/ssl/SSL_CTX_set_verify.html
+func (c *Ctx) GetVerifyDepth() int {
+	return int(C.SSL_CTX_get_verify_depth(c.ctx))
+}
+
+type TLSExtServernameCallback func(ssl *SSL) SSLTLSExtErr
+
+// SetTLSExtServernameCallback sets callback function for Server Name Indication
+// (SNI) rfc6066 (http://tools.ietf.org/html/rfc6066). See
+// http://stackoverflow.com/questions/22373332/serving-multiple-domains-in-one-box-with-sni
+func (c *Ctx) SetTLSExtServernameCallback(sni_cb TLSExtServernameCallback) {
+	c.sni_cb = sni_cb
+	C.SSL_CTX_set_tlsext_servername_callback_not_a_macro(c.ctx, (*[0]byte)(C.sni_cb))
 }
 
 func (c *Ctx) SetSessionId(session_id []byte) error {
@@ -688,4 +801,29 @@ const (
 func (c *Ctx) SetSessionCacheMode(modes SessionCacheModes) SessionCacheModes {
 	return SessionCacheModes(
 		C.SSL_CTX_set_session_cache_mode_not_a_macro(c.ctx, C.long(modes)))
+}
+
+// Set session cache timeout. Returns previously set value.
+// See https://www.openssl.org/docs/ssl/SSL_CTX_set_timeout.html
+func (c *Ctx) SetTimeout(t time.Duration) time.Duration {
+	prev := C.SSL_CTX_set_timeout_not_a_macro(c.ctx, C.long(t/time.Second))
+	return time.Duration(prev) * time.Second
+}
+
+// Get session cache timeout.
+// See https://www.openssl.org/docs/ssl/SSL_CTX_set_timeout.html
+func (c *Ctx) GetTimeout() time.Duration {
+	return time.Duration(C.SSL_CTX_get_timeout_not_a_macro(c.ctx)) * time.Second
+}
+
+// Set session cache size. Returns previously set value.
+// https://www.openssl.org/docs/ssl/SSL_CTX_sess_set_cache_size.html
+func (c *Ctx) SessSetCacheSize(t int) int {
+	return int(C.SSL_CTX_sess_set_cache_size_not_a_macro(c.ctx, C.long(t)))
+}
+
+// Get session cache size.
+// https://www.openssl.org/docs/ssl/SSL_CTX_sess_set_cache_size.html
+func (c *Ctx) SessGetCacheSize() int {
+	return int(C.SSL_CTX_sess_get_cache_size_not_a_macro(c.ctx))
 }

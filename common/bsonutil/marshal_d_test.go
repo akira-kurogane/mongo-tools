@@ -78,12 +78,12 @@ func TestMarshalDMarshalJSON(t *testing.T) {
 func TestFindValueByKey(t *testing.T) {
 	Convey("Given a bson.D document and a specific key", t, func() {
 		subDocument := &bson.D{
-			bson.DocElem{"field4", "c"},
+			bson.DocElem{Name: "field4", Value: "c"},
 		}
 		document := &bson.D{
-			bson.DocElem{"field1", "a"},
-			bson.DocElem{"field2", "b"},
-			bson.DocElem{"field3", subDocument},
+			bson.DocElem{Name: "field1", Value: "a"},
+			bson.DocElem{Name: "field2", Value: "b"},
+			bson.DocElem{Name: "field3", Value: subDocument},
 		}
 		Convey("the corresponding value top-level keys should be returned", func() {
 			value, err := FindValueByKey("field1", document)
@@ -99,6 +99,26 @@ func TestFindValueByKey(t *testing.T) {
 			value, err := FindValueByKey("field4", document)
 			So(value, ShouldBeNil)
 			So(err, ShouldNotBeNil)
+		})
+	})
+}
+
+func TestEscapedKey(t *testing.T) {
+	Convey("Given a bson.D document with a key that requires escaping", t, func() {
+		document := bson.D{
+			bson.DocElem{Name: `foo"bar`, Value: "a"},
+		}
+		Convey("it can be marshaled without error", func() {
+			asJSON, err := json.Marshal(MarshalD(document))
+			So(err, ShouldBeNil)
+			Convey("and subsequently unmarshaled without error", func() {
+				var asMap bson.M
+				err := json.Unmarshal(asJSON, &asMap)
+				So(err, ShouldBeNil)
+				Convey("with the original value being correctly found with the unescaped key", func() {
+					So(asMap[`foo"bar`], ShouldEqual, "a")
+				})
+			})
 		})
 	})
 }

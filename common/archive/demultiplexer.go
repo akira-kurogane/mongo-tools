@@ -3,14 +3,16 @@ package archive
 import (
 	"bytes"
 	"fmt"
+	"hash"
+	"hash/crc64"
+	"io"
+	"sync"
+	"sync/atomic"
+
 	"github.com/mongodb/mongo-tools/common/db"
 	"github.com/mongodb/mongo-tools/common/intents"
 	"github.com/mongodb/mongo-tools/common/log"
 	"gopkg.in/mgo.v2/bson"
-	"hash"
-	"hash/crc64"
-	"io"
-	"sync/atomic"
 )
 
 // DemuxOut is a Demultiplexer output consumer
@@ -18,6 +20,7 @@ import (
 type DemuxOut interface {
 	Write([]byte) (int, error)
 	Close() error
+	Sum64() (uint64, bool)
 }
 
 // Demultiplexer implements Parser.
@@ -25,7 +28,6 @@ type Demultiplexer struct {
 	In io.Reader
 	//TODO wrap up these three into a structure
 	outs               map[string]DemuxOut
-	hashes             map[string]hash.Hash64
 	lengths            map[string]int64
 	currentNamespace   string
 	buf                [db.MaxBSONSize]byte
@@ -38,9 +40,9 @@ func (demux *Demultiplexer) Run() error {
 	parser := Parser{In: demux.In}
 	err := parser.ReadAllBlocks(demux)
 	if len(demux.outs) > 0 {
-		log.Logf(log.Always, "demux finishing when there are still outs (%v)", len(demux.outs))
+		log.Logvf(log.Always, "demux finishing when there are still outs (%v)", len(demux.outs))
 	}
-	log.Logf(log.DebugLow, "demux finishing (err:%v)", err)
+	log.Logvf(log.DebugLow, "demux finishing (err:%v)", err)
 	return err
 }
 
@@ -81,7 +83,7 @@ func (demux *Demultiplexer) HeaderBSON(buf []byte) error {
 	if err != nil {
 		return newWrappedError("header bson doesn't unmarshal as a collection header", err)
 	}
-	log.Logf(log.DebugHigh, "demux namespaceHeader: %v", colHeader)
+	log.Logvf(log.DebugHigh, "demux namespaceHeader: %v", colHeader)
 	if colHeader.Collection == "" {
 		return newError("collection header is missing a Collection")
 	}
@@ -103,21 +105,27 @@ func (demux *Demultiplexer) HeaderBSON(buf []byte) error {
 		}
 	}
 	if colHeader.EOF {
-		crc := int64(demux.hashes[demux.currentNamespace].Sum64())
-		length := int64(demux.lengths[demux.currentNamespace])
-		if crc != colHeader.CRC {
-			return fmt.Errorf("CRC mismatch for namespace %v, %v!=%v",
-				demux.currentNamespace,
-				crc,
-				colHeader.CRC,
-			)
-		}
-		log.Logf(log.DebugHigh,
-			"demux checksum for namespace %v is correct (%v), %v bytes",
-			demux.currentNamespace, crc, length)
 		demux.outs[demux.currentNamespace].Close()
+		length := int64(demux.lengths[demux.currentNamespace])
+		crcUInt64, ok := demux.outs[demux.currentNamespace].Sum64()
+		if ok {
+			crc := int64(crcUInt64)
+			if crc != colHeader.CRC {
+				return fmt.Errorf("CRC mismatch for namespace %v, %v!=%v",
+					demux.currentNamespace,
+					crc,
+					colHeader.CRC,
+				)
+			}
+			log.Logvf(log.DebugHigh,
+				"demux checksum for namespace %v is correct (%v), %v bytes",
+				demux.currentNamespace, crc, length)
+		} else {
+			log.Logvf(log.DebugHigh,
+				"demux checksum for namespace %v was not calculated.",
+				demux.currentNamespace)
+		}
 		delete(demux.outs, demux.currentNamespace)
-		delete(demux.hashes, demux.currentNamespace)
 		delete(demux.lengths, demux.currentNamespace)
 		// in case we get a BSONBody with this block,
 		// we want to ensure that that causes an error
@@ -128,7 +136,7 @@ func (demux *Demultiplexer) HeaderBSON(buf []byte) error {
 
 // End is part of the ParserConsumer interface and receives the end of archive notification.
 func (demux *Demultiplexer) End() error {
-	log.Logf(log.DebugHigh, "demux End")
+	log.Logvf(log.DebugHigh, "demux End")
 	if len(demux.outs) != 0 {
 		openNss := []string{}
 		for ns := range demux.outs {
@@ -149,11 +157,6 @@ func (demux *Demultiplexer) BodyBSON(buf []byte) error {
 	if demux.currentNamespace == "" {
 		return newError("collection data without a collection header")
 	}
-	hash, ok := demux.hashes[demux.currentNamespace]
-	if !ok {
-		return newError("no checksum for current namespace " + demux.currentNamespace)
-	}
-	hash.Write(buf)
 
 	demux.lengths[demux.currentNamespace] += int64(len(buf))
 
@@ -171,30 +174,35 @@ func (demux *Demultiplexer) Open(ns string, out DemuxOut) {
 	// or while the demutiplexer is inside of the NamespaceChan NamespaceErrorChan conversation
 	// I think that we don't need to lock outs, but I suspect that if the implementation changes
 	// we may need to lock when outs is accessed
-	log.Logf(log.DebugHigh, "demux Open")
+	log.Logvf(log.DebugHigh, "demux Open")
 	if demux.outs == nil {
 		demux.outs = make(map[string]DemuxOut)
-		demux.hashes = make(map[string]hash.Hash64)
 		demux.lengths = make(map[string]int64)
 	}
 	demux.outs[ns] = out
-	demux.hashes[ns] = crc64.New(crc64.MakeTable(crc64.ECMA))
 	demux.lengths[ns] = 0
 }
 
 // RegularCollectionReceiver implements the intents.file interface.
-// RegularCollectionReceivers get paired with RegularCollectionSenders.
 type RegularCollectionReceiver struct {
-	readLenChan      <-chan int
-	readBufChan      chan<- []byte
+	pos              int64 // updated atomically, aligned at the beginning of the struct
+	readLenChan      chan int
+	readBufChan      chan []byte
 	Intent           *intents.Intent
+	Origin           string
 	Demux            *Demultiplexer
-	partialReadArray [db.MaxBSONSize]byte
+	partialReadArray []byte
 	partialReadBuf   []byte
-	isOpen           bool
-	pos              int64
+	hash             hash.Hash64
+	closeOnce        sync.Once
+	openOnce         sync.Once
 }
 
+func (receiver *RegularCollectionReceiver) Sum64() (uint64, bool) {
+	return receiver.hash.Sum64(), true
+}
+
+// Read() runs in the restoring goroutine
 func (receiver *RegularCollectionReceiver) Read(r []byte) (int, error) {
 	if receiver.partialReadBuf != nil && len(receiver.partialReadBuf) > 0 {
 		wLen := len(receiver.partialReadBuf)
@@ -224,8 +232,9 @@ func (receiver *RegularCollectionReceiver) Read(r []byte) (int, error) {
 		receiver.readBufChan <- receiver.partialReadBuf
 		writtenLength := <-receiver.readLenChan
 		if wLen != writtenLength {
-			return 0, fmt.Errorf("regularCollectionSender didn't send what it said it would")
+			return 0, fmt.Errorf("regularCollectionReceiver didn't send what it said it would")
 		}
+		receiver.hash.Write(receiver.partialReadBuf)
 		copy(r, receiver.partialReadBuf)
 		receiver.partialReadBuf = receiver.partialReadBuf[rLen:]
 		atomic.AddInt64(&receiver.pos, int64(rLen))
@@ -235,19 +244,13 @@ func (receiver *RegularCollectionReceiver) Read(r []byte) (int, error) {
 	receiver.readBufChan <- r
 	// Receiver the wLen of data written
 	wLen = <-receiver.readLenChan
+	receiver.hash.Write(r[:wLen])
 	atomic.AddInt64(&receiver.pos, int64(wLen))
 	return wLen, nil
 }
 
 func (receiver *RegularCollectionReceiver) Pos() int64 {
 	return atomic.LoadInt64(&receiver.pos)
-}
-
-// Close is part of the intents.file interface. It currently does nothing. We can't close the
-// regularCollectionSender before the embedded stream reaches EOF. If this needs to be
-// implemented, then we need to swap out the regularCollectionSender with a null writer
-func (receiver *RegularCollectionReceiver) Close() error {
-	return nil
 }
 
 // Open is part of the intents.file interface.  It creates the chan's in the
@@ -258,62 +261,68 @@ func (receiver *RegularCollectionReceiver) Open() error {
 	// So that we don't have to enable this double open stuff.
 	// Currently the open needs to finish before the prioritizer.Get finishes, so we open the intents.file
 	// in prioritizer.Get even though it's going to get opened again in DumpIntent.
-	if receiver.isOpen {
-		return nil
-	}
-	readLenChan := make(chan int)
-	readBufChan := make(chan []byte)
-	receiver.readLenChan = readLenChan
-	receiver.readBufChan = readBufChan
-	sender := &regularCollectionSender{readLenChan: readLenChan, readBufChan: readBufChan}
-	receiver.Demux.Open(receiver.Intent.Namespace(), sender)
-	receiver.isOpen = true
+	receiver.openOnce.Do(func() {
+		receiver.readLenChan = make(chan int)
+		receiver.readBufChan = make(chan []byte)
+		receiver.hash = crc64.New(crc64.MakeTable(crc64.ECMA))
+		receiver.Demux.Open(receiver.Origin, receiver)
+	})
 	return nil
 }
 
-// Write is part of the intents.file interface.
-// It does nothing, and only exists so that RegularCollectionReceiver fulfills the interface
-func (receiver *RegularCollectionReceiver) Write([]byte) (int, error) {
-	return 0, nil
-}
+func (receiver *RegularCollectionReceiver) TakeIOBuffer(ioBuf []byte) {
+	receiver.partialReadArray = ioBuf
 
-// regularCollectionSender implements DemuxOut
-type regularCollectionSender struct {
-	readLenChan chan<- int
-	readBufChan <-chan []byte
+}
+func (receiver *RegularCollectionReceiver) ReleaseIOBuffer() {
+	receiver.partialReadArray = nil
 }
 
 // Write is part of the DemuxOut interface.
-func (sender *regularCollectionSender) Write(buf []byte) (int, error) {
+func (receiver *RegularCollectionReceiver) Write(buf []byte) (int, error) {
 	//  As a writer, we need to write first, so that the reader can properly detect EOF
 	//  Additionally, the reader needs to know the write size, so that it can give us a
 	//  properly sized buffer. Sending the incomming buffersize fills both of these needs.
-	sender.readLenChan <- len(buf)
+	receiver.readLenChan <- len(buf)
 	// Receive from the reader a buffer to put the bytes into
-	readBuf := <-sender.readBufChan
+	readBuf := <-receiver.readBufChan
 	if len(readBuf) < len(buf) {
 		return 0, fmt.Errorf("readbuf is not large enough for incoming BodyBSON (%v<%v)",
 			len(readBuf), len(buf))
 	}
 	copy(readBuf, buf)
 	// Send back the length of the data copied in to the buffer
-	sender.readLenChan <- len(buf)
+	receiver.readLenChan <- len(buf)
 	return len(buf), nil
 }
 
-// Close is part of the DemuxOut interface. It only closes the readLenChan, as that is what will
+// Close is part of the DemuxOut as well as the intents.file interface. It only closes the readLenChan, as that is what will
 // cause the RegularCollectionReceiver.Read() to receive EOF
-func (sender *regularCollectionSender) Close() error {
-	close(sender.readLenChan)
+// Close will get called twice, once in the demultiplexer, and again when the restore goroutine is done with its intent.file
+func (receiver *RegularCollectionReceiver) Close() error {
+	receiver.closeOnce.Do(func() {
+		close(receiver.readLenChan)
+		// make sure that we don't return until any reader has finished
+		<-receiver.readBufChan
+	})
 	return nil
 }
 
 // SpecialCollectionCache implemnts both DemuxOut as well as intents.file
 type SpecialCollectionCache struct {
+	pos    int64 // updated atomically, aligned at the beginning of the struct
 	Intent *intents.Intent
 	Demux  *Demultiplexer
-	bytes.Buffer
-	pos int64
+	buf    bytes.Buffer
+	hash   hash.Hash64
+}
+
+func NewSpecialCollectionCache(intent *intents.Intent, demux *Demultiplexer) *SpecialCollectionCache {
+	return &SpecialCollectionCache{
+		Intent: intent,
+		Demux:  demux,
+		hash:   crc64.New(crc64.MakeTable(crc64.ECMA)),
+	}
 }
 
 // Open is part of the both interfaces, and it does nothing
@@ -323,18 +332,27 @@ func (cache *SpecialCollectionCache) Open() error {
 
 // Close is part of the both interfaces, and it does nothing
 func (cache *SpecialCollectionCache) Close() error {
-	cache.Intent.Size = int64(cache.Buffer.Len())
+	cache.Intent.Size = int64(cache.buf.Len())
 	return nil
 }
 
 func (cache *SpecialCollectionCache) Read(p []byte) (int, error) {
-	n, err := cache.Buffer.Read(p)
+	n, err := cache.buf.Read(p)
 	atomic.AddInt64(&cache.pos, int64(n))
 	return n, err
 }
 
 func (cache *SpecialCollectionCache) Pos() int64 {
 	return atomic.LoadInt64(&cache.pos)
+}
+
+func (cache *SpecialCollectionCache) Write(b []byte) (int, error) {
+	cache.hash.Write(b)
+	return cache.buf.Write(b)
+}
+
+func (cache *SpecialCollectionCache) Sum64() (uint64, bool) {
+	return cache.hash.Sum64(), true
 }
 
 // MutedCollection implements both DemuxOut as well as intents.file. It serves as a way to
@@ -363,6 +381,11 @@ func (*MutedCollection) Close() error {
 // Open is part of the intents.file interface, and does nothing
 func (*MutedCollection) Open() error {
 	return nil
+}
+
+// Sum64 is part of the DemuxOut interface
+func (*MutedCollection) Sum64() (uint64, bool) {
+	return 0, false
 }
 
 //===== Archive Manager Prioritizer =====

@@ -2,21 +2,22 @@
 package mongoimport
 
 import (
-	"fmt"
 	"github.com/mongodb/mongo-tools/common/db"
 	"github.com/mongodb/mongo-tools/common/log"
 	"github.com/mongodb/mongo-tools/common/options"
 	"github.com/mongodb/mongo-tools/common/progress"
-	"github.com/mongodb/mongo-tools/common/text"
 	"github.com/mongodb/mongo-tools/common/util"
 	"gopkg.in/mgo.v2"
 	"gopkg.in/mgo.v2/bson"
 	"gopkg.in/tomb.v2"
+
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 // Input format types accepted by mongoimport.
@@ -26,16 +27,26 @@ const (
 	JSON = "json"
 )
 
+// Modes accepted by mongoimport.
 const (
-	maxBSONSize         = 16 * (1024 * 1024)
-	maxMessageSizeBytes = 2 * maxBSONSize
-	workerBufferSize    = 16
-	progressBarLength   = 24
+	modeInsert = "insert"
+	modeUpsert = "upsert"
+	modeMerge  = "merge"
+)
+
+const (
+	workerBufferSize  = 16
+	progressBarLength = 24
 )
 
 // MongoImport is a container for the user-specified options and
 // internal state used for running mongoimport.
 type MongoImport struct {
+	// insertionCount keeps track of how many documents have successfully
+	// been inserted into the database
+	// updated atomically, aligned at the beginning of the struct
+	insertionCount uint64
+
 	// generic mongo tool options
 	ToolOptions *options.ToolOptions
 
@@ -47,14 +58,6 @@ type MongoImport struct {
 
 	// SessionProvider is used for connecting to the database
 	SessionProvider *db.SessionProvider
-
-	// insertionLock is used to prevent race conditions in incrementing
-	// the insertion count
-	insertionLock sync.Mutex
-
-	// insertionCount keeps track of how many documents have successfully
-	// been inserted into the database
-	insertionCount uint64
 
 	// the tomb is used to synchronize ingestion goroutines and causes
 	// other sibling goroutines to terminate immediately if one errors out
@@ -77,6 +80,11 @@ type InputReader interface {
 	// a non-nil error if the fields from the header line are invalid; returns
 	// nil otherwise. No-op for JSON input readers.
 	ReadAndValidateHeader() error
+
+	// ReadAndValidateTypedHeader is the same as ReadAndValidateHeader,
+	// except it also parses types from the fields of the header. Parse errors
+	// will be handled according parseGrace.
+	ReadAndValidateTypedHeader(parseGrace ParseGrace) error
 
 	// embedded io.Reader that tracks number of bytes read, to allow feeding into progress bar.
 	sizeTracker
@@ -130,6 +138,10 @@ func (imp *MongoImport) ValidateSettings(args []string) error {
 				return fmt.Errorf("incompatible options: --fieldFile and --headerline")
 			}
 		}
+
+		if _, err := ValidatePG(imp.InputOptions.ParseGrace); err != nil {
+			return err
+		}
 	} else {
 		// input type is JSON
 		if imp.InputOptions.HeaderLine {
@@ -144,35 +156,60 @@ func (imp *MongoImport) ValidateSettings(args []string) error {
 		if imp.IngestOptions.IgnoreBlanks {
 			return fmt.Errorf("can not use --ignoreBlanks when input type is JSON")
 		}
+		if imp.InputOptions.ColumnsHaveTypes {
+			return fmt.Errorf("can not use --columnsHaveTypes when input type is JSON")
+		}
 	}
 
+	// deprecated
+	if imp.IngestOptions.Upsert == true {
+		imp.IngestOptions.Mode = modeUpsert
+	}
+
+	// parse UpsertFields, may set default mode to modeUpsert
 	if imp.IngestOptions.UpsertFields != "" {
-		imp.IngestOptions.Upsert = true
+		if imp.IngestOptions.Mode == "" {
+			imp.IngestOptions.Mode = modeUpsert
+		} else if imp.IngestOptions.Mode == modeInsert {
+			return fmt.Errorf("can not use --upsertFields with --mode=insert")
+		}
 		imp.upsertFields = strings.Split(imp.IngestOptions.UpsertFields, ",")
 		if err := validateFields(imp.upsertFields); err != nil {
 			return fmt.Errorf("invalid --upsertFields argument: %v", err)
 		}
-	} else if imp.IngestOptions.Upsert {
+	} else if imp.IngestOptions.Mode != modeInsert {
 		imp.upsertFields = []string{"_id"}
 	}
 
-	if imp.IngestOptions.Upsert {
+	// set default mode, must be after parsing UpsertFields
+	if imp.IngestOptions.Mode == "" {
+		imp.IngestOptions.Mode = modeInsert
+	}
+
+	// double-check mode choices
+	if !(imp.IngestOptions.Mode == modeInsert ||
+		imp.IngestOptions.Mode == modeUpsert ||
+		imp.IngestOptions.Mode == modeMerge) {
+		return fmt.Errorf("invalid --mode argument: %v", imp.IngestOptions.Mode)
+	}
+
+	if imp.IngestOptions.Mode != modeInsert {
 		imp.IngestOptions.MaintainInsertionOrder = true
-		log.Logf(log.Info, "using upsert fields: %v", imp.upsertFields)
+		log.Logvf(log.Info, "using upsert fields: %v", imp.upsertFields)
 	}
 
 	// set the number of decoding workers to use for imports
-	if imp.ToolOptions.NumDecodingWorkers <= 0 {
-		imp.ToolOptions.NumDecodingWorkers = imp.ToolOptions.MaxProcs
+	if imp.IngestOptions.NumDecodingWorkers <= 0 {
+		imp.IngestOptions.NumDecodingWorkers = imp.ToolOptions.MaxProcs
 	}
-	log.Logf(log.DebugLow, "using %v decoding workers", imp.ToolOptions.NumDecodingWorkers)
+	log.Logvf(log.DebugLow, "using %v decoding workers", imp.IngestOptions.NumDecodingWorkers)
 
 	// set the number of insertion workers to use for imports
 	if imp.IngestOptions.NumInsertionWorkers <= 0 {
 		imp.IngestOptions.NumInsertionWorkers = 1
 	}
 
-	log.Logf(log.DebugLow, "using %v insert workers", imp.IngestOptions.NumInsertionWorkers)
+	log.Logvf(log.DebugLow, "using %v insert workers", imp.IngestOptions.NumInsertionWorkers)
 
 	// if --maintainInsertionOrder is set, we can only allow 1 insertion worker
 	if imp.IngestOptions.MaintainInsertionOrder {
@@ -180,8 +217,8 @@ func (imp *MongoImport) ValidateSettings(args []string) error {
 	}
 
 	// get the number of documents per batch
-	if imp.ToolOptions.BulkBufferSize <= 0 {
-		imp.ToolOptions.BulkBufferSize = 10000
+	if imp.IngestOptions.BulkBufferSize <= 0 || imp.IngestOptions.BulkBufferSize > 1000 {
+		imp.IngestOptions.BulkBufferSize = 1000
 	}
 
 	// ensure no more than one positional argument is supplied
@@ -204,13 +241,13 @@ func (imp *MongoImport) ValidateSettings(args []string) error {
 
 	// ensure we have a valid string to use for the collection
 	if imp.ToolOptions.Collection == "" {
-		log.Logf(log.Always, "no collection specified")
+		log.Logvf(log.Always, "no collection specified")
 		fileBaseName := filepath.Base(imp.InputOptions.File)
 		lastDotIndex := strings.LastIndex(fileBaseName, ".")
 		if lastDotIndex != -1 {
 			fileBaseName = fileBaseName[0:lastDotIndex]
 		}
-		log.Logf(log.Always, "using filename '%v' as collection", fileBaseName)
+		log.Logvf(log.Always, "using filename '%v' as collection", fileBaseName)
 		imp.ToolOptions.Collection = fileBaseName
 	}
 	err = util.ValidateCollectionName(imp.ToolOptions.Collection)
@@ -233,11 +270,11 @@ func (imp *MongoImport) getSourceReader() (io.ReadCloser, int64, error) {
 		if err != nil {
 			return nil, -1, err
 		}
-		log.Logf(log.Info, "filesize: %v bytes", fileStat.Size())
+		log.Logvf(log.Info, "filesize: %v bytes", fileStat.Size())
 		return file, int64(fileStat.Size()), err
 	}
 
-	log.Logf(log.Info, "reading from stdin")
+	log.Logvf(log.Info, "reading from stdin")
 
 	// Stdin has undefined max size, so return 0
 	return os.Stdin, 0, nil
@@ -251,7 +288,7 @@ type fileSizeProgressor struct {
 }
 
 func (fsp *fileSizeProgressor) Progress() (int64, int64) {
-	return fsp.max, fsp.sizeTracker.Size()
+	return fsp.sizeTracker.Size(), fsp.max
 }
 
 // ImportDocuments is used to write input data to the database. It returns the
@@ -270,7 +307,12 @@ func (imp *MongoImport) ImportDocuments() (uint64, error) {
 	}
 
 	if imp.InputOptions.HeaderLine {
-		if err = inputReader.ReadAndValidateHeader(); err != nil {
+		if imp.InputOptions.ColumnsHaveTypes {
+			err = inputReader.ReadAndValidateTypedHeader(ParsePG(imp.InputOptions.ParseGrace))
+		} else {
+			err = inputReader.ReadAndValidateHeader()
+		}
+		if err != nil {
 			return 0, err
 		}
 	}
@@ -304,9 +346,9 @@ func (imp *MongoImport) importDocuments(inputReader InputReader) (numImported ui
 	if imp.ToolOptions.Port != "" {
 		connURL = connURL + ":" + imp.ToolOptions.Port
 	}
-	log.Logf(log.Always, "connected to: %v", connURL)
+	log.Logvf(log.Always, "connected to: %v", connURL)
 
-	log.Logf(log.Info, "ns: %v.%v",
+	log.Logvf(log.Info, "ns: %v.%v",
 		imp.ToolOptions.Namespace.DB,
 		imp.ToolOptions.Namespace.Collection)
 
@@ -315,7 +357,7 @@ func (imp *MongoImport) importDocuments(inputReader InputReader) (numImported ui
 	if err != nil {
 		return 0, fmt.Errorf("error checking connected node type: %v", err)
 	}
-	log.Logf(log.Info, "connected to node type: %v", imp.nodeType)
+	log.Logvf(log.Info, "connected to node type: %v", imp.nodeType)
 
 	if err = imp.configureSession(session); err != nil {
 		return 0, fmt.Errorf("error configuring session: %v", err)
@@ -323,7 +365,7 @@ func (imp *MongoImport) importDocuments(inputReader InputReader) (numImported ui
 
 	// drop the database if necessary
 	if imp.IngestOptions.Drop {
-		log.Logf(log.Always, "dropping: %v.%v",
+		log.Logvf(log.Always, "dropping: %v.%v",
 			imp.ToolOptions.DB,
 			imp.ToolOptions.Collection)
 		collection := session.DB(imp.ToolOptions.DB).
@@ -349,7 +391,9 @@ func (imp *MongoImport) importDocuments(inputReader InputReader) (numImported ui
 		processingErrChan <- imp.ingestDocuments(readDocs)
 	}()
 
-	return imp.insertionCount, channelQuorumError(processingErrChan, 2)
+	e1 := channelQuorumError(processingErrChan, 2)
+	insertionCount := atomic.LoadUint64(&imp.insertionCount)
+	return insertionCount, e1
 }
 
 // ingestDocuments accepts a channel from which it reads documents to be inserted
@@ -369,16 +413,13 @@ func (imp *MongoImport) ingestDocuments(readDocs chan bson.D) (retErr error) {
 	// 3. There is an insertion/update error - e.g. duplicate key
 	//    error - and stopOnError is set to true
 
-	wg := &sync.WaitGroup{}
-	mt := &sync.Mutex{}
+	wg := new(sync.WaitGroup)
 	for i := 0; i < numInsertionWorkers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			// only set the first insertion error and cause sibling goroutines to terminate immediately
 			err := imp.runInsertionWorker(readDocs)
-			mt.Lock()
-			defer mt.Unlock()
 			if err != nil && retErr == nil {
 				retErr = err
 				imp.Kill(err)
@@ -409,6 +450,11 @@ func (imp *MongoImport) configureSession(session *mgo.Session) error {
 	return nil
 }
 
+type flushInserter interface {
+	Insert(doc interface{}) error
+	Flush() error
+}
+
 // runInsertionWorker is a helper to InsertDocuments - it reads document off
 // the read channel and prepares then in batches for insertion into the databas
 func (imp *MongoImport) runInsertionWorker(readDocs chan bson.D) (err error) {
@@ -421,10 +467,16 @@ func (imp *MongoImport) runInsertionWorker(readDocs chan bson.D) (err error) {
 		return fmt.Errorf("error configuring session: %v", err)
 	}
 	collection := session.DB(imp.ToolOptions.DB).C(imp.ToolOptions.Collection)
-	ignoreBlanks := imp.IngestOptions.IgnoreBlanks && imp.InputOptions.Type != JSON
-	var documentBytes []byte
-	var documents []bson.Raw
-	numMessageBytes := 0
+
+	var inserter flushInserter
+	if imp.IngestOptions.Mode == modeInsert {
+		inserter = db.NewBufferedBulkInserter(collection, imp.IngestOptions.BulkBufferSize, !imp.IngestOptions.StopOnError)
+		if !imp.IngestOptions.MaintainInsertionOrder {
+			inserter.(*db.BufferedBulkInserter).Unordered()
+		}
+	} else {
+		inserter = imp.newUpserter(collection)
+	}
 
 readLoop:
 	for {
@@ -433,142 +485,122 @@ readLoop:
 			if !alive {
 				break readLoop
 			}
-			// the mgo driver doesn't currently respect the maxBatchSize
-			// limit so we self impose a limit by using maxMessageSizeBytes
-			// and send documents over the wire when we hit the batch size
-			// or when we're at/over the maximum message size threshold
-			if len(documents) == imp.ToolOptions.BulkBufferSize || numMessageBytes >= maxMessageSizeBytes {
-				if err = imp.insert(documents, collection); err != nil {
-					return err
-				}
-				documents = documents[:0]
-				numMessageBytes = 0
-			}
-
-			// ignore blank fields if specified
-			if ignoreBlanks {
-				document = removeBlankFields(document)
-			}
-			if documentBytes, err = bson.Marshal(document); err != nil {
+			err = filterIngestError(imp.IngestOptions.StopOnError, inserter.Insert(document))
+			if err != nil {
 				return err
 			}
-			if len(documentBytes) > maxBSONSize {
-				log.Logf(log.Always, "warning: attempting to insert document with size %v (exceeds %v limit)",
-					text.FormatByteAmount(int64(len(documentBytes))), text.FormatByteAmount(maxBSONSize))
-			}
-			numMessageBytes += len(documentBytes)
-			documents = append(documents, bson.Raw{3, documentBytes})
+			atomic.AddUint64(&imp.insertionCount, 1)
 		case <-imp.Dying():
 			return nil
 		}
 	}
 
-	// ingest any documents left in slice
-	if len(documents) != 0 {
-		return imp.insert(documents, collection)
+	err = inserter.Flush()
+	// TOOLS-349 correct import count for bulk operations
+	if bulkError, ok := err.(*mgo.BulkError); ok {
+		failedDocs := make(map[int]bool) // index of failures
+		for _, failure := range bulkError.Cases() {
+			failedDocs[failure.Index] = true
+		}
+		numFailures := len(failedDocs)
+		if numFailures > 0 {
+			log.Logvf(log.Always, "num failures: %d", numFailures)
+			atomic.AddUint64(&imp.insertionCount, ^uint64(numFailures-1))
+		}
 	}
+	return filterIngestError(imp.IngestOptions.StopOnError, err)
+}
+
+type upserter struct {
+	imp        *MongoImport
+	collection *mgo.Collection
+}
+
+func (imp *MongoImport) newUpserter(collection *mgo.Collection) *upserter {
+	return &upserter{
+		imp:        imp,
+		collection: collection,
+	}
+}
+
+// Insert is part of the flushInserter interface and performs
+// upserts or inserts.
+func (up *upserter) Insert(doc interface{}) error {
+	document := doc.(bson.D)
+	selector := constructUpsertDocument(up.imp.upsertFields, document)
+	var err error
+	if selector == nil { // modeInsert || doc-not-exist
+		err = up.collection.Insert(document)
+	} else if up.imp.IngestOptions.Mode == modeUpsert {
+		_, err = up.collection.Upsert(selector, document)
+	} else { // modeMerge
+		_, err = up.collection.Upsert(selector, bson.M{"$set": document})
+	}
+	return err
+}
+
+// Flush is needed so that upserter implements flushInserter, but upserter
+// doesn't buffer anything so we don't need to do anything in Flush.
+func (up *upserter) Flush() error {
 	return nil
 }
 
-// TODO: TOOLS-317: add tests/update this to be more efficient
-// handleUpsert upserts documents into the database - used if --upsert is passed
-// to mongoimport
-func (imp *MongoImport) handleUpsert(documents []bson.Raw, collection *mgo.Collection) (numInserted int, err error) {
-	stopOnError := imp.IngestOptions.StopOnError
-	for _, rawBsonDocument := range documents {
-		document := bson.D{}
-		err = bson.Unmarshal(rawBsonDocument.Data, &document)
-		if err != nil {
-			return numInserted, fmt.Errorf("error unmarshaling document: %v", err)
+func splitInlineHeader(header string) (headers []string) {
+	var level uint8
+	var currentField string
+	for _, c := range header {
+		if c == '(' {
+			level++
+		} else if c == ')' && level > 0 {
+			level--
 		}
-		selector := constructUpsertDocument(imp.upsertFields, document)
-		if selector == nil {
-			err = collection.Insert(document)
+		if c == ',' && level == 0 {
+			headers = append(headers, currentField)
+			currentField = ""
 		} else {
-			_, err = collection.Upsert(selector, document)
-		}
-		if err == nil {
-			numInserted++
-		}
-		if err = filterIngestError(stopOnError, err); err != nil {
-			return numInserted, err
+			currentField = currentField + string(c)
 		}
 	}
-	return numInserted, nil
-}
-
-// insert  performs the actual insertion/updates. If no upsert fields are
-// present in the document to be inserted, it simply inserts the documents
-// into the given collection
-func (imp *MongoImport) insert(documents []bson.Raw, collection *mgo.Collection) (err error) {
-	numInserted := 0
-	stopOnError := imp.IngestOptions.StopOnError
-	maintainInsertionOrder := imp.IngestOptions.MaintainInsertionOrder
-
-	defer func() {
-		imp.insertionLock.Lock()
-		imp.insertionCount += uint64(numInserted)
-		imp.insertionLock.Unlock()
-	}()
-
-	if imp.IngestOptions.Upsert {
-		numInserted, err = imp.handleUpsert(documents, collection)
-		return err
-	}
-	if len(documents) == 0 {
-		return
-	}
-	bulk := collection.Bulk()
-	for _, document := range documents {
-		bulk.Insert(document)
-	}
-	if !maintainInsertionOrder {
-		bulk.Unordered()
-	}
-
-	// mgo.Bulk doesn't currently implement write commands so mgo.BulkResult
-	// isn't informative
-	_, err = bulk.Run()
-
-	// TOOLS-349: Note that this count may not be entirely accurate if some
-	// ingester workers insert when another errors out.
-	//
-	// Without write commands, we can't say for sure how many documents
-	// were inserted when we use bulk inserts so we assume the entire batch
-	// insert failed if an error is returned. The result is that we may
-	// report that less documents - than were actually inserted - were
-	// inserted into the database. This will change as soon as BulkResults
-	// are supported by the driver
-	if err == nil {
-		numInserted = len(documents)
-	}
-	return filterIngestError(stopOnError, err)
+	headers = append(headers, currentField) // add last field
+	return
 }
 
 // getInputReader returns an implementation of InputReader based on the input type
 func (imp *MongoImport) getInputReader(in io.Reader) (InputReader, error) {
-	var fields []string
+	var colSpecs []ColumnSpec
+	var headers []string
 	var err error
 	if imp.InputOptions.Fields != nil {
-		fields = strings.Split(*imp.InputOptions.Fields, ",")
+		headers = splitInlineHeader(*imp.InputOptions.Fields)
 	} else if imp.InputOptions.FieldFile != nil {
-		fields, err = util.GetFieldsFromFile(*imp.InputOptions.FieldFile)
+		headers, err = util.GetFieldsFromFile(*imp.InputOptions.FieldFile)
 		if err != nil {
 			return nil, err
 		}
 	}
+	if imp.InputOptions.ColumnsHaveTypes {
+		colSpecs, err = ParseTypedHeaders(headers, ParsePG(imp.InputOptions.ParseGrace))
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		colSpecs = ParseAutoHeaders(headers)
+	}
 
 	// header fields validation can only happen once we have an input reader
 	if !imp.InputOptions.HeaderLine {
-		if err = validateReaderFields(fields); err != nil {
+		if err = validateReaderFields(ColumnNames(colSpecs)); err != nil {
 			return nil, err
 		}
 	}
 
+	out := os.Stdout
+
+	ignoreBlanks := imp.IngestOptions.IgnoreBlanks && imp.InputOptions.Type != JSON
 	if imp.InputOptions.Type == CSV {
-		return NewCSVInputReader(fields, in, imp.ToolOptions.NumDecodingWorkers), nil
+		return NewCSVInputReader(colSpecs, in, out, imp.IngestOptions.NumDecodingWorkers, ignoreBlanks), nil
 	} else if imp.InputOptions.Type == TSV {
-		return NewTSVInputReader(fields, in, imp.ToolOptions.NumDecodingWorkers), nil
+		return NewTSVInputReader(colSpecs, in, out, imp.IngestOptions.NumDecodingWorkers, ignoreBlanks), nil
 	}
-	return NewJSONInputReader(imp.InputOptions.JSONArray, in, imp.ToolOptions.NumDecodingWorkers), nil
+	return NewJSONInputReader(imp.InputOptions.JSONArray, in, imp.IngestOptions.NumDecodingWorkers), nil
 }

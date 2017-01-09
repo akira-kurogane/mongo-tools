@@ -3,12 +3,13 @@ package mongoimport
 import (
 	"errors"
 	"fmt"
+	"io"
+	"strings"
+
 	"github.com/mongodb/mongo-tools/common/bsonutil"
 	"github.com/mongodb/mongo-tools/common/json"
 	"github.com/mongodb/mongo-tools/common/log"
 	"gopkg.in/mgo.v2/bson"
-	"io"
-	"strings"
 )
 
 // JSONInputReader is an implementation of InputReader that reads documents
@@ -70,7 +71,7 @@ var (
 // NewJSONInputReader creates a new JSONInputReader in array mode if specified,
 // configured to read data to the given io.Reader.
 func NewJSONInputReader(isArray bool, in io.Reader, numDecoders int) *JSONInputReader {
-	szCount := newSizeTrackingReader(in)
+	szCount := newSizeTrackingReader(newBomDiscardingReader(in))
 	return &JSONInputReader{
 		isArray:            isArray,
 		sizeTracker:        szCount,
@@ -83,6 +84,11 @@ func NewJSONInputReader(isArray bool, in io.Reader, numDecoders int) *JSONInputR
 
 // ReadAndValidateHeader is a no-op for JSON imports; always returns nil.
 func (r *JSONInputReader) ReadAndValidateHeader() error {
+	return nil
+}
+
+// ReadAndValidateTypedHeader is a no-op for JSON imports; always returns nil.
+func (r *JSONInputReader) ReadAndValidateTypedHeader(parseGrace ParseGrace) error {
 	return nil
 }
 
@@ -143,13 +149,13 @@ func (c JSONConverter) Convert() (bson.D, error) {
 	if err != nil {
 		return nil, fmt.Errorf("error unmarshaling bytes on document #%v: %v", c.index, err)
 	}
-	log.Logf(log.DebugHigh, "got line: %v", document)
+	log.Logvf(log.DebugHigh, "got line: %v", document)
 
 	bsonD, err := bsonutil.GetExtendedBsonD(document)
 	if err != nil {
 		return nil, fmt.Errorf("error getting extended BSON for document #%v: %v", c.index, err)
 	}
-	log.Logf(log.DebugHigh, "got extended line: %#v", bsonD)
+	log.Logvf(log.DebugHigh, "got extended line: %#v", bsonD)
 	return bsonD, nil
 }
 

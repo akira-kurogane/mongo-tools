@@ -3,15 +3,15 @@
 package db
 
 import (
-	"fmt"
 	"github.com/mongodb/mongo-tools/common/options"
 	"github.com/mongodb/mongo-tools/common/password"
 	"gopkg.in/mgo.v2"
 	"gopkg.in/mgo.v2/bson"
+
+	"fmt"
 	"io"
 	"strings"
 	"sync"
-	"time"
 )
 
 type (
@@ -43,12 +43,16 @@ const (
 	ErrNsNotFound         = "ns not found"
 	// replication errors list the replset name if we are talking to a mongos,
 	// so we can only check for this universal prefix
-	ErrReplTimeoutPrefix = "waiting for replication timed out"
+	ErrReplTimeoutPrefix            = "waiting for replication timed out"
+	ErrCouldNotContactPrimaryPrefix = "could not contact primary for replica set"
+	ErrCouldNotFindPrimaryPrefix    = `could not find host matching read preference { mode: "primary"`
+	ErrUnableToTargetPrefix         = "unable to target"
+	ErrNotMaster                    = "not master"
+	ErrConnectionRefusedSuffix      = "Connection refused"
 )
 
 var (
-	DefaultDialTimeout = time.Second * 3
-	GetConnectorFuncs  = []GetConnectorFunc{}
+	GetConnectorFuncs = []GetConnectorFunc{}
 )
 
 // Used to manage database sessions
@@ -110,6 +114,13 @@ func (self *SessionProvider) GetSession() (*mgo.Session, error) {
 
 	// copy the provider's master session, for connection pooling
 	return self.masterSession.Copy(), nil
+}
+
+// Close closes the master session in the connection pool
+func (self *SessionProvider) Close() {
+	self.masterSessionLock.Lock()
+	defer self.masterSessionLock.Unlock()
+	self.masterSession.Close()
 }
 
 // refresh is a helper for modifying the session based on the
@@ -215,8 +226,14 @@ func IsConnectionError(err error) bool {
 	if err == nil {
 		return false
 	}
-	if err.Error() == ErrNoReachableServers || err.Error() == io.EOF.Error() ||
-		strings.HasPrefix(err.Error(), ErrReplTimeoutPrefix) {
+	if err.Error() == ErrNoReachableServers ||
+		err.Error() == io.EOF.Error() ||
+		strings.HasPrefix(err.Error(), ErrReplTimeoutPrefix) ||
+		strings.HasPrefix(err.Error(), ErrCouldNotContactPrimaryPrefix) ||
+		strings.HasPrefix(err.Error(), ErrCouldNotFindPrimaryPrefix) ||
+		strings.HasPrefix(err.Error(), ErrUnableToTargetPrefix) ||
+		err.Error() == ErrNotMaster ||
+		strings.HasSuffix(err.Error(), ErrConnectionRefusedSuffix) {
 		return true
 	}
 	return false

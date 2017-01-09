@@ -43,7 +43,7 @@ func (mo *MongoOplog) Run() error {
 		return fmt.Errorf("the oplog namespace must specify a collection")
 	}
 
-	log.Logf(log.DebugLow, "using oplog namespace `%v.%v`", oplogDB, oplogColl)
+	log.Logvf(log.DebugLow, "using oplog namespace `%v.%v`", oplogDB, oplogColl)
 
 	// connect to the destination server
 	toSession, err := mo.SessionProviderTo.GetSession()
@@ -58,7 +58,7 @@ func (mo *MongoOplog) Run() error {
 	if mo.ToolOptions.Port != "" {
 		destServerStr = destServerStr + ":" + mo.ToolOptions.Port
 	}
-	log.Logf(log.DebugLow, "successfully connected to destination server `%v`", destServerStr)
+	log.Logvf(log.DebugLow, "successfully connected to destination server `%v`", destServerStr)
 
 	// connect to the source server
 	fromSession, err := mo.SessionProviderFrom.GetSession()
@@ -68,7 +68,7 @@ func (mo *MongoOplog) Run() error {
 	defer fromSession.Close()
 	fromSession.SetSocketTimeout(0)
 
-	log.Logf(log.DebugLow, "successfully connected to source server `%v`", mo.SourceOptions.From)
+	log.Logvf(log.DebugLow, "successfully connected to source server `%v`", mo.SourceOptions.From)
 
 	// set slave ok
 	fromSession.SetMode(mgo.Eventual, true)
@@ -83,15 +83,18 @@ func (mo *MongoOplog) Run() error {
 	oplogEntry := &db.Oplog{}
 	res := &db.ApplyOpsResponse{}
 
-	log.Log(log.DebugLow, "applying oplog entries...")
+	log.Logv(log.DebugLow, "applying oplog entries...")
+
+	opCount := 0
 
 	for tail.Next(oplogEntry) {
 
 		// skip noops
 		if oplogEntry.Operation == "n" {
-			log.Logf(log.DebugHigh, "skipping no-op for namespace `%v`", oplogEntry.Namespace)
+			log.Logvf(log.DebugHigh, "skipping no-op for namespace `%v`", oplogEntry.Namespace)
 			continue
 		}
+		opCount++
 
 		// prepare the op to be applied
 		opsToApply := []db.Oplog{*oplogEntry}
@@ -114,7 +117,7 @@ func (mo *MongoOplog) Run() error {
 		return fmt.Errorf("error querying oplog: %v", err)
 	}
 
-	log.Log(log.DebugLow, "done applying oplog entries")
+	log.Logvf(log.DebugLow, "done applying %v oplog entries", opCount)
 
 	return nil
 }

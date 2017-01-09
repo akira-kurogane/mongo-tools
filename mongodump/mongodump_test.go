@@ -3,6 +3,13 @@ package mongodump
 import (
 	"bytes"
 	"fmt"
+	"io/ioutil"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"testing"
+
 	"github.com/mongodb/mongo-tools/common/bsonutil"
 	"github.com/mongodb/mongo-tools/common/db"
 	"github.com/mongodb/mongo-tools/common/json"
@@ -13,12 +20,6 @@ import (
 	. "github.com/smartystreets/goconvey/convey"
 	"gopkg.in/mgo.v2"
 	"gopkg.in/mgo.v2/bson"
-	"io/ioutil"
-	"os"
-	"path/filepath"
-	"regexp"
-	"strings"
-	"testing"
 )
 
 var (
@@ -46,12 +47,11 @@ func simpleMongoDumpInstance() *MongoDump {
 		Port: testPort,
 	}
 	toolOptions := &options.ToolOptions{
-		SSL:           &ssl,
-		Namespace:     namespace,
-		Connection:    connection,
-		Auth:          &auth,
-		HiddenOptions: &options.HiddenOptions{},
-		Verbosity:     &options.Verbosity{},
+		SSL:        &ssl,
+		Namespace:  namespace,
+		Connection: connection,
+		Auth:       &auth,
+		Verbosity:  &options.Verbosity{},
 	}
 	outputOptions := &OutputOptions{
 		NumParallelCollections: 1,
@@ -435,7 +435,7 @@ func TestMongoDumpBSON(t *testing.T) {
 				Convey("it dumps to standard output", func() {
 					md.OutputOptions.Out = "-"
 					stdoutBuf := &bytes.Buffer{}
-					md.stdout = stdoutBuf
+					md.OutputWriter = stdoutBuf
 					err = md.Dump()
 					So(err, ShouldBeNil)
 					var count int

@@ -3,6 +3,11 @@ package mongoexport
 
 import (
 	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+
 	"github.com/mongodb/mongo-tools/common/bsonutil"
 	"github.com/mongodb/mongo-tools/common/db"
 	"github.com/mongodb/mongo-tools/common/json"
@@ -12,19 +17,12 @@ import (
 	"github.com/mongodb/mongo-tools/common/util"
 	"gopkg.in/mgo.v2"
 	"gopkg.in/mgo.v2/bson"
-	"io"
-	"os"
-	"path/filepath"
-	"strings"
-	"time"
 )
 
 // Output types supported by mongoexport.
 const (
 	CSV                            = "csv"
 	JSON                           = "json"
-	progressBarLength              = 24
-	progressBarWaitTime            = time.Second
 	watchProgressorUpdateFrequency = 8000
 )
 
@@ -42,6 +40,8 @@ type MongoExport struct {
 	// for connecting to the db
 	SessionProvider *db.SessionProvider
 	ExportOutput    ExportOutput
+
+	ProgressManager progress.Manager
 }
 
 // ExportOutput is an interface that specifies how a document should be formatted
@@ -71,18 +71,22 @@ func (exp *MongoExport) ValidateSettings() error {
 	if exp.ToolOptions.Namespace.DB == "" {
 		exp.ToolOptions.Namespace.DB = "test"
 	}
+	err := util.ValidateDBName(exp.ToolOptions.Namespace.DB)
+	if err != nil {
+		return err
+	}
 
 	if exp.ToolOptions.Namespace.Collection == "" {
 		return fmt.Errorf("must specify a collection")
 	}
-	if err := util.ValidateCollectionName(exp.ToolOptions.Namespace.Collection); err != nil {
+	if err = util.ValidateCollectionGrammar(exp.ToolOptions.Namespace.Collection); err != nil {
 		return err
 	}
 
 	exp.OutputOpts.Type = strings.ToLower(exp.OutputOpts.Type)
 
-	if exp.ToolOptions.HiddenOptions.CSVOutputType {
-		log.Log(log.Always, "csv flag is deprecated; please use --type=csv instead")
+	if exp.OutputOpts.CSVOutputType {
+		log.Logv(log.Always, "csv flag is deprecated; please use --type=csv instead")
 		exp.OutputOpts.Type = CSV
 	}
 
@@ -229,15 +233,30 @@ func (exp *MongoExport) getCursor() (*mgo.Iter, *mgo.Session, error) {
 		}
 	}
 
-	flags := 0
-	if len(query) == 0 && exp.InputOpts != nil &&
-		exp.InputOpts.ForceTableScan != true && exp.InputOpts.Sort == "" {
-		flags = flags | db.Snapshot
-	}
-
 	session, err := exp.SessionProvider.GetSession()
 	if err != nil {
 		return nil, nil, err
+	}
+	collection := session.DB(exp.ToolOptions.Namespace.DB).C(exp.ToolOptions.Namespace.Collection)
+
+	// figure out if we're exporting a view
+	isView := false
+	opts, err := db.GetCollectionOptions(collection)
+	if err != nil {
+		return nil, nil, err
+	}
+	if opts != nil {
+		viewOn, _ := bsonutil.FindValueByKey("viewOn", opts)
+		if viewOn != nil {
+			isView = true
+		}
+	}
+
+	flags := 0
+	// don't snapshot if we've been asked not to,
+	// or if we cannot because  we are querying, sorting, or if the collection is a view
+	if !exp.InputOpts.ForceTableScan && len(query) == 0 && exp.InputOpts != nil && exp.InputOpts.Sort == "" && !isView {
+		flags = flags | db.Snapshot
 	}
 
 	skip := 0
@@ -249,10 +268,19 @@ func (exp *MongoExport) getCursor() (*mgo.Iter, *mgo.Session, error) {
 		limit = exp.InputOpts.Limit
 	}
 
+	if exp.InputOpts.AssertExists {
+		collNames, err := session.DB(exp.ToolOptions.Namespace.DB).CollectionNames()
+		if err != nil {
+			return nil, session, err
+		}
+		if !util.StringSliceContains(collNames, exp.ToolOptions.Namespace.Collection) {
+			return nil, session, fmt.Errorf("collection '%s' does not exist",
+				exp.ToolOptions.Namespace.Collection)
+		}
+	}
+
 	// build the query
-	q := session.DB(exp.ToolOptions.Namespace.DB).
-		C(exp.ToolOptions.Namespace.Collection).Find(query).Sort(sortFields...).
-		Skip(skip).Limit(limit)
+	q := collection.Find(query).Sort(sortFields...).Skip(skip).Limit(limit)
 
 	if len(exp.OutputOpts.Fields) > 0 {
 		q.Select(makeFieldSelector(exp.OutputOpts.Fields))
@@ -273,18 +301,12 @@ func (exp *MongoExport) exportInternal(out io.Writer) (int64, error) {
 		return 0, err
 	}
 
-	progressManager := progress.NewProgressBarManager(log.Writer(0), progressBarWaitTime)
-	progressManager.Start()
-	defer progressManager.Stop()
-
 	watchProgressor := progress.NewCounter(int64(max))
-	bar := &progress.Bar{
-		Name:      fmt.Sprintf("%v.%v", exp.ToolOptions.Namespace.DB, exp.ToolOptions.Namespace.Collection),
-		Watching:  watchProgressor,
-		BarLength: progressBarLength,
+	if exp.ProgressManager != nil {
+		name := fmt.Sprintf("%v.%v", exp.ToolOptions.Namespace.DB, exp.ToolOptions.Namespace.Collection)
+		exp.ProgressManager.Attach(name, watchProgressor)
+		defer exp.ProgressManager.Detach(name)
 	}
-	progressManager.Attach(bar)
-	defer progressManager.Detach(bar)
 
 	exportOutput, err := exp.getExportOutput(out)
 	if err != nil {
@@ -305,7 +327,7 @@ func (exp *MongoExport) exportInternal(out io.Writer) (int64, error) {
 	if exp.ToolOptions.Port != "" {
 		connURL = connURL + ":" + exp.ToolOptions.Port
 	}
-	log.Logf(log.Always, "connected to: %v", connURL)
+	log.Logvf(log.Always, "connected to: %v", connURL)
 
 	// Write headers
 	err = exportOutput.WriteHeader()
@@ -378,7 +400,8 @@ func (exp *MongoExport) getExportOutput(out io.Writer) (ExportOutput, error) {
 				exportFields = append(exportFields, field)
 			}
 		}
-		return NewCSVExportOutput(exportFields, out), nil
+
+		return NewCSVExportOutput(exportFields, exp.OutputOpts.NoHeaderLine, out), nil
 	}
 	return NewJSONExportOutput(exp.OutputOpts.JSONArray, exp.OutputOpts.Pretty, out), nil
 }

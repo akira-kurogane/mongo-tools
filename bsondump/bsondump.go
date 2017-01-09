@@ -9,6 +9,7 @@ import (
 	"github.com/mongodb/mongo-tools/common/json"
 	"github.com/mongodb/mongo-tools/common/log"
 	"github.com/mongodb/mongo-tools/common/options"
+	"github.com/mongodb/mongo-tools/common/util"
 	"gopkg.in/mgo.v2/bson"
 	"io"
 	"os"
@@ -24,36 +25,61 @@ type BSONDump struct {
 	// BSONDumpOptions defines options used to control how BSON data is displayed
 	BSONDumpOptions *BSONDumpOptions
 
-	// Path to the BSON file
-	FileName string
+	// File handle for the output data.
+	Out io.WriteCloser
 
-	// Handle to where the BSON data should be displayed
-	Out io.Writer
-
-	bsonSource *db.BSONSource
+	BSONSource *db.BSONSource
 }
 
-// Open opens the relevant file for reading. It returns a
-// non-nil error if it is unable to open the file.
-func (bd *BSONDump) Open() error {
-	file, err := os.Open(bd.FileName)
-	if err != nil {
-		return fmt.Errorf("couldn't open BSON file: %v", err)
+type ReadNopCloser struct {
+	io.Reader
+}
+
+func (ReadNopCloser) Close() error { return nil }
+
+type WriteNopCloser struct {
+	io.Writer
+}
+
+func (WriteNopCloser) Close() error { return nil }
+
+// GetWriter opens and returns an io.WriteCloser for the OutFileName in BSONDumpOptions
+// or nil if none is set. The caller is responsible for closing it.
+func (bdo *BSONDumpOptions) GetWriter() (io.WriteCloser, error) {
+	if bdo.OutFileName != "" {
+		file, err := os.Create(util.ToUniversalPath(bdo.OutFileName))
+		if err != nil {
+			return nil, err
+		}
+		return file, nil
 	}
-	bd.bsonSource = db.NewBSONSource(file)
-	return nil
+
+	return WriteNopCloser{os.Stdout}, nil
 }
 
-func printJSON(doc *bson.Raw, out io.Writer, pretty bool) error {
+// GetBSONReader opens and returns an io.ReadCloser for the BSONFileName in BSONDumpOptions
+// or nil if none is set. The caller is responsible for closing it.
+func (bdo *BSONDumpOptions) GetBSONReader() (io.ReadCloser, error) {
+	if bdo.BSONFileName != "" {
+		file, err := os.Open(util.ToUniversalPath(bdo.BSONFileName))
+		if err != nil {
+			return nil, fmt.Errorf("couldn't open BSON file: %v", err)
+		}
+		return file, nil
+	}
+	return ReadNopCloser{os.Stdin}, nil
+}
+
+func formatJSON(doc *bson.Raw, pretty bool) ([]byte, error) {
 	decodedDoc := bson.D{}
 	err := bson.Unmarshal(doc.Data, &decodedDoc)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	extendedDoc, err := bsonutil.ConvertBSONValueToJSON(decodedDoc)
 	if err != nil {
-		return fmt.Errorf("error converting BSON to extended JSON: %v", err)
+		return nil, fmt.Errorf("error converting BSON to extended JSON: %v", err)
 	}
 	jsonBytes, err := json.Marshal(extendedDoc)
 	if pretty {
@@ -62,10 +88,9 @@ func printJSON(doc *bson.Raw, out io.Writer, pretty bool) error {
 		jsonBytes = jsonFormatted.Bytes()
 	}
 	if err != nil {
-		return fmt.Errorf("error converting doc to JSON: %v", err)
+		return nil, fmt.Errorf("error converting doc to JSON: %v", err)
 	}
-	_, err = out.Write(jsonBytes)
-	return err
+	return jsonBytes, nil
 }
 
 // JSON iterates through the BSON file and for each document it finds,
@@ -76,24 +101,24 @@ func printJSON(doc *bson.Raw, out io.Writer, pretty bool) error {
 func (bd *BSONDump) JSON() (int, error) {
 	numFound := 0
 
-	if bd.bsonSource == nil {
+	if bd.BSONSource == nil {
 		panic("Tried to call JSON() before opening file")
 	}
 
-	decodedStream := db.NewDecodedBSONSource(bd.bsonSource)
-	defer decodedStream.Close()
+	decodedStream := db.NewDecodedBSONSource(bd.BSONSource)
 
 	var result bson.Raw
 	for decodedStream.Next(&result) {
-		if err := printJSON(&result, bd.Out, bd.BSONDumpOptions.Pretty); err != nil {
-			log.Logf(log.Always, "unable to dump document %v: %v", numFound+1, err)
+		if bytes, err := formatJSON(&result, bd.BSONDumpOptions.Pretty); err != nil {
+			log.Logvf(log.Always, "unable to dump document %v: %v", numFound+1, err)
 
 			//if objcheck is turned on, stop now. otherwise keep on dumpin'
 			if bd.BSONDumpOptions.ObjCheck {
 				return numFound, err
 			}
 		} else {
-			_, err := bd.Out.Write([]byte("\n"))
+			bytes = append(bytes, '\n')
+			_, err := bd.Out.Write(bytes)
 			if err != nil {
 				return numFound, err
 			}
@@ -114,15 +139,13 @@ func (bd *BSONDump) JSON() (int, error) {
 func (bd *BSONDump) Debug() (int, error) {
 	numFound := 0
 
-	if bd.bsonSource == nil {
+	if bd.BSONSource == nil {
 		panic("Tried to call Debug() before opening file")
 	}
 
-	defer bd.bsonSource.Close()
-
 	var result bson.Raw
 	for {
-		doc := bd.bsonSource.LoadNext()
+		doc := bd.BSONSource.LoadNext()
 		if doc == nil {
 			break
 		}
@@ -138,12 +161,12 @@ func (bd *BSONDump) Debug() (int, error) {
 		}
 		err := printBSON(result, 0, bd.Out)
 		if err != nil {
-			log.Logf(log.Always, "encountered error debugging BSON data: %v", err)
+			log.Logvf(log.Always, "encountered error debugging BSON data: %v", err)
 		}
 		numFound++
 	}
 
-	if err := bd.bsonSource.Err(); err != nil {
+	if err := bd.BSONSource.Err(); err != nil {
 		// This error indicates the BSON document header is corrupted;
 		// either the 4-byte header couldn't be read in full, or
 		// the size in the header would require reading more bytes

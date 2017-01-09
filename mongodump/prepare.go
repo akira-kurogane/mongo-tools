@@ -1,20 +1,18 @@
 package mongodump
 
 import (
-	"bufio"
 	"bytes"
-	"compress/gzip"
 	"fmt"
-	"github.com/mongodb/mongo-tools/common/archive"
-	"github.com/mongodb/mongo-tools/common/bsonutil"
-	"github.com/mongodb/mongo-tools/common/db"
-	"github.com/mongodb/mongo-tools/common/intents"
-	"github.com/mongodb/mongo-tools/common/log"
-	"gopkg.in/mgo.v2/bson"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/mongodb/mongo-tools/common/archive"
+	"github.com/mongodb/mongo-tools/common/db"
+	"github.com/mongodb/mongo-tools/common/intents"
+	"github.com/mongodb/mongo-tools/common/log"
+	"gopkg.in/mgo.v2/bson"
 )
 
 type NilPos struct{}
@@ -25,7 +23,12 @@ func (NilPos) Pos() int64 {
 
 type collectionInfo struct {
 	Name    string  `bson:"name"`
+	Type    string  `bson:"type"`
 	Options *bson.D `bson:"options"`
+}
+
+func (ci *collectionInfo) IsView() bool {
+	return ci.Type == "view"
 }
 
 // writeFlusher wraps an io.Writer and adds a Flush function.
@@ -38,18 +41,6 @@ type writeFlusher interface {
 // a Close function which is implemented by calling Flush.
 type writeFlushCloser struct {
 	writeFlusher
-}
-
-// availableWriteFlusher wraps a writeFlusher and adds an Available function.
-type availableWriteFlusher interface {
-	Available() int
-	writeFlusher
-}
-
-// atomicFlusher is a availableWriteFlusher implementation
-// which guarantees atomic writes.
-type atomicFlusher struct {
-	availableWriteFlusher
 }
 
 // errorReader implements io.Reader.
@@ -74,7 +65,6 @@ type realBSONFile struct {
 	// intent.file ( a ReadWriteOpenCloser )
 	errorReader
 	intent *intents.Intent
-	gzip   bool
 	NilPos
 }
 
@@ -92,43 +82,12 @@ func (f *realBSONFile) Open() (err error) {
 			filepath.Dir(f.path), err)
 	}
 
-	fileName := f.path
-	file, err := os.Create(fileName)
+	f.WriteCloser, err = os.Create(f.path)
 	if err != nil {
-		return fmt.Errorf("error creating BSON file %v: %v", fileName, err)
-	}
-	var writeCloser io.WriteCloser
-	if f.gzip {
-		writeCloser = gzip.NewWriter(file)
-	} else {
-		// wrap writer in buffer to reduce load on disk
-		writeCloser = writeFlushCloser{
-			atomicFlusher{
-				bufio.NewWriterSize(file, 32*1024),
-			},
-		}
-	}
-	f.WriteCloser = &wrappedWriteCloser{
-		WriteCloser: writeCloser,
-		inner:       file,
+		return fmt.Errorf("error creating BSON file %v: %v", f.path, err)
 	}
 
 	return nil
-}
-
-// Write guarantees that when it returns, either the entire
-// contents of buf or none of it, has been flushed by the writer.
-// This is useful in the unlikely case that mongodump crashes.
-func (f atomicFlusher) Write(buf []byte) (int, error) {
-	if len(buf) > f.availableWriteFlusher.Available() {
-		f.availableWriteFlusher.Flush()
-	}
-	if len(buf) > f.availableWriteFlusher.Available() {
-		l, e := f.availableWriteFlusher.Write(buf)
-		f.availableWriteFlusher.Flush()
-		return l, e
-	}
-	return f.availableWriteFlusher.Write(buf)
 }
 
 // realMetadataFile implements intent.file, and corresponds to a Metadata file on disk
@@ -139,12 +98,10 @@ type realMetadataFile struct {
 	// errorWrite adds a Read() method to this object allowing it to be an
 	// intent.file ( a ReadWriteOpenCloser )
 	intent *intents.Intent
-	gzip   bool
 	NilPos
 }
 
 // Open opens the file on disk that the intent indicates. Any directories needed are created.
-// If compression is needed, the File gets wrapped in a gzip.Writer
 func (f *realMetadataFile) Open() (err error) {
 	if f.path == "" {
 		return fmt.Errorf("No metadata path for %v.%v", f.intent.DB, f.intent.C)
@@ -155,16 +112,9 @@ func (f *realMetadataFile) Open() (err error) {
 			filepath.Dir(f.path), err)
 	}
 
-	fileName := f.path
-	f.WriteCloser, err = os.Create(fileName)
+	f.WriteCloser, err = os.Create(f.path)
 	if err != nil {
-		return fmt.Errorf("error creating metadata file %v: %v", fileName, err)
-	}
-	if f.gzip {
-		f.WriteCloser = &wrappedWriteCloser{
-			WriteCloser: gzip.NewWriter(f.WriteCloser),
-			inner:       f.WriteCloser,
-		}
+		return fmt.Errorf("error creating metadata file %v: %v", f.path, err)
 	}
 	return nil
 }
@@ -236,7 +186,7 @@ func (dump *MongoDump) NewIntent(dbName, colName string) (*intents.Intent, error
 		C:  colName,
 	}
 	if dump.OutputOptions.Out == "-" {
-		intent.BSONFile = &stdoutFile{Writer: dump.stdout}
+		intent.BSONFile = &stdoutFile{Writer: dump.OutputWriter}
 	} else {
 		if dump.OutputOptions.Archive != "" {
 			intent.BSONFile = &archive.MuxIn{Intent: intent, Mux: dump.archive.Mux}
@@ -246,11 +196,8 @@ func (dump *MongoDump) NewIntent(dbName, colName string) (*intents.Intent, error
 				return nil, fmt.Errorf(`"%v.%v" contains a path separator '%c' `+
 					`and can't be dumped to the filesystem`, dbName, colName, c)
 			}
-			path := dump.outputPath(dbName, colName) + ".bson"
-			if dump.OutputOptions.Gzip {
-				path += ".gz"
-			}
-			intent.BSONFile = &realBSONFile{path: path, intent: intent, gzip: dump.OutputOptions.Gzip}
+			path := nameGz(dump.OutputOptions.Gzip, dump.outputPath(dbName, colName)+".bson")
+			intent.BSONFile = &realBSONFile{path: path, intent: intent}
 		}
 		if !intent.IsSystemIndexes() {
 			if dump.OutputOptions.Archive != "" {
@@ -259,17 +206,14 @@ func (dump *MongoDump) NewIntent(dbName, colName string) (*intents.Intent, error
 					Buffer: &bytes.Buffer{},
 				}
 			} else {
-				path := dump.outputPath(dbName, colName+".metadata.json")
-				if dump.OutputOptions.Gzip {
-					path += ".gz"
-				}
-				intent.MetadataFile = &realMetadataFile{path: path, intent: intent, gzip: dump.OutputOptions.Gzip}
+				path := nameGz(dump.OutputOptions.Gzip, dump.outputPath(dbName, colName+".metadata.json"))
+				intent.MetadataFile = &realMetadataFile{path: path, intent: intent}
 			}
 		}
 	}
 
 	// get a document count for scheduling purposes
-	session, err := dump.sessionProvider.GetSession()
+	session, err := dump.SessionProvider.GetSession()
 	if err != nil {
 		return nil, err
 	}
@@ -297,7 +241,7 @@ func (dump *MongoDump) CreateOplogIntents() error {
 	if dump.OutputOptions.Archive != "" {
 		oplogIntent.BSONFile = &archive.MuxIn{Mux: dump.archive.Mux, Intent: oplogIntent}
 	} else {
-		oplogIntent.BSONFile = &realBSONFile{path: dump.outputPath("oplog.bson", ""), intent: oplogIntent, gzip: dump.OutputOptions.Gzip}
+		oplogIntent.BSONFile = &realBSONFile{path: dump.outputPath("oplog.bson", ""), intent: oplogIntent}
 	}
 	dump.manager.Put(oplogIntent)
 	return nil
@@ -327,9 +271,9 @@ func (dump *MongoDump) CreateUsersRolesVersionIntentsForDB(db string) error {
 		rolesIntent.BSONFile = &archive.MuxIn{Intent: rolesIntent, Mux: dump.archive.Mux}
 		versionIntent.BSONFile = &archive.MuxIn{Intent: versionIntent, Mux: dump.archive.Mux}
 	} else {
-		usersIntent.BSONFile = &realBSONFile{path: filepath.Join(outDir, "$admin.system.users.bson"), intent: usersIntent, gzip: dump.OutputOptions.Gzip}
-		rolesIntent.BSONFile = &realBSONFile{path: filepath.Join(outDir, "$admin.system.roles.bson"), intent: rolesIntent, gzip: dump.OutputOptions.Gzip}
-		versionIntent.BSONFile = &realBSONFile{path: filepath.Join(outDir, "$admin.system.version.bson"), intent: versionIntent, gzip: dump.OutputOptions.Gzip}
+		usersIntent.BSONFile = &realBSONFile{path: filepath.Join(outDir, nameGz(dump.OutputOptions.Gzip, "$admin.system.users.bson")), intent: usersIntent}
+		rolesIntent.BSONFile = &realBSONFile{path: filepath.Join(outDir, nameGz(dump.OutputOptions.Gzip, "$admin.system.roles.bson")), intent: rolesIntent}
+		versionIntent.BSONFile = &realBSONFile{path: filepath.Join(outDir, nameGz(dump.OutputOptions.Gzip, "$admin.system.version.bson")), intent: versionIntent}
 	}
 	dump.manager.Put(usersIntent)
 	dump.manager.Put(rolesIntent)
@@ -342,7 +286,7 @@ func (dump *MongoDump) CreateUsersRolesVersionIntentsForDB(db string) error {
 // puts it into the intent manager.
 func (dump *MongoDump) CreateCollectionIntent(dbName, colName string) error {
 	if dump.shouldSkipCollection(colName) {
-		log.Logf(log.DebugLow, "skipping dump of %v.%v, it is excluded", dbName, colName)
+		log.Logvf(log.DebugLow, "skipping dump of %v.%v, it is excluded", dbName, colName)
 		return nil
 	}
 
@@ -351,47 +295,51 @@ func (dump *MongoDump) CreateCollectionIntent(dbName, colName string) error {
 		return err
 	}
 
-	session, err := dump.sessionProvider.GetSession()
+	session, err := dump.SessionProvider.GetSession()
 	if err != nil {
 		return err
 	}
 	defer session.Close()
 
-	opts, err := db.GetCollectionOptions(session.DB(dbName).C(colName))
+	intent.Options, err = db.GetCollectionOptions(session.DB(dbName).C(colName))
 	if err != nil {
 		return fmt.Errorf("error getting collection options: %v", err)
 	}
 
-	intent.Options = nil
-	if opts != nil {
-		optsInterface, _ := bsonutil.FindValueByKey("options", opts)
-		if optsInterface != nil {
-			if optsD, ok := optsInterface.(bson.D); ok {
-				intent.Options = &optsD
-			} else {
-				return fmt.Errorf("Failed to parse collection options as bson.D")
-			}
-		}
-	}
-
 	dump.manager.Put(intent)
 
-	log.Logf(log.DebugLow, "enqueued collection '%v'", intent.Namespace())
+	log.Logvf(log.DebugLow, "enqueued collection '%v'", intent.Namespace())
 	return nil
 }
 
 func (dump *MongoDump) createIntentFromOptions(dbName string, ci *collectionInfo) error {
 	if dump.shouldSkipCollection(ci.Name) {
-		log.Logf(log.DebugLow, "skipping dump of %v.%v, it is excluded", dbName, ci.Name)
+		log.Logvf(log.DebugLow, "skipping dump of %v.%v, it is excluded", dbName, ci.Name)
 		return nil
 	}
+
+	if dump.OutputOptions.ViewsAsCollections && !ci.IsView() {
+		log.Logvf(log.DebugLow, "skipping dump of %v.%v because it is not a view", dbName, ci.Name)
+		return nil
+	}
+
 	intent, err := dump.NewIntent(dbName, ci.Name)
 	if err != nil {
 		return err
 	}
+	if dump.OutputOptions.ViewsAsCollections {
+		log.Logvf(log.DebugLow, "not dumping metadata for %v.%v because it is a view", dbName, ci.Name)
+		intent.MetadataFile = nil
+	} else if ci.IsView() {
+		log.Logvf(log.DebugLow, "not dumping data for %v.%v because it is a view", dbName, ci.Name)
+		// only write a bson file if using archive
+		if dump.OutputOptions.Archive == "" {
+			intent.BSONFile = nil
+		}
+	}
 	intent.Options = ci.Options
 	dump.manager.Put(intent)
-	log.Logf(log.DebugLow, "enqueued collection '%v'", intent.Namespace())
+	log.Logvf(log.DebugLow, "enqueued collection '%v'", intent.Namespace())
 	return nil
 }
 
@@ -400,7 +348,7 @@ func (dump *MongoDump) createIntentFromOptions(dbName string, ci *collectionInfo
 func (dump *MongoDump) CreateIntentsForDatabase(dbName string) error {
 	// we must ensure folders for empty databases are still created, for legacy purposes
 
-	session, err := dump.sessionProvider.GetSession()
+	session, err := dump.SessionProvider.GetSession()
 	if err != nil {
 		return err
 	}
@@ -413,6 +361,11 @@ func (dump *MongoDump) CreateIntentsForDatabase(dbName string) error {
 
 	collInfo := &collectionInfo{}
 	for colsIter.Next(collInfo) {
+		// ignore <db>.system.* except for admin
+		if dbName != "admin" && strings.HasPrefix(collInfo.Name, "system.") {
+			log.Logvf(log.DebugHigh, "will not dump system collection '%s.%s'", dbName, collInfo.Name)
+			continue
+		}
 		// Skip over indexes since they are also listed in system.namespaces in 2.6 or earlier
 		if strings.Contains(collInfo.Name, "$") && !strings.Contains(collInfo.Name, ".oplog.$") {
 			continue
@@ -438,11 +391,11 @@ func (dump *MongoDump) CreateIntentsForDatabase(dbName string) error {
 // CreateAllIntents iterates through all dbs and collections and builds
 // dump intents for each collection.
 func (dump *MongoDump) CreateAllIntents() error {
-	dbs, err := dump.sessionProvider.DatabaseNames()
+	dbs, err := dump.SessionProvider.DatabaseNames()
 	if err != nil {
 		return fmt.Errorf("error getting database names: %v", err)
 	}
-	log.Logf(log.DebugHigh, "found databases: %v", strings.Join(dbs, ", "))
+	log.Logvf(log.DebugHigh, "found databases: %v", strings.Join(dbs, ", "))
 	for _, dbName := range dbs {
 		if dbName == "local" {
 			// local can only be explicitly dumped
@@ -453,4 +406,11 @@ func (dump *MongoDump) CreateAllIntents() error {
 		}
 	}
 	return nil
+}
+
+func nameGz(gz bool, name string) string {
+	if gz {
+		return name + ".gz"
+	}
+	return name
 }
