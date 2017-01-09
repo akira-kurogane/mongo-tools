@@ -76,7 +76,7 @@ func (imp *MongoDocGen) ValidateOptions(args []string) error {
 		imp.IngestOptions.NumInsertionWorkers = 1
 	}
 
-	log.Logf(log.DebugLow, "using %v insert workers", imp.IngestOptions.NumInsertionWorkers)
+	log.Logvf(log.DebugLow, "using %v insert workers", imp.IngestOptions.NumInsertionWorkers)
 
 	// ensure no more than one positional argument is supplied
 	if len(args) > 1 {
@@ -170,9 +170,9 @@ func (imp *MongoDocGen) generateDocuments(documentGenerator TemplateDocumentGene
 	if imp.ToolOptions.Port != "" {
 		connURL = connURL + ":" + imp.ToolOptions.Port
 	}
-	log.Logf(log.Always, "connected to: %v", connURL)
+	log.Logvf(log.Always, "connected to: %v", connURL)
 
-	log.Logf(log.Info, "ns: %v.%v",
+	log.Logvf(log.Info, "ns: %v.%v",
 		imp.ToolOptions.Namespace.DB,
 		imp.ToolOptions.Namespace.Collection)
 
@@ -181,7 +181,7 @@ func (imp *MongoDocGen) generateDocuments(documentGenerator TemplateDocumentGene
 	if err != nil {
 		return 0, fmt.Errorf("error checking connected node type: %v", err)
 	}
-	log.Logf(log.Info, "connected to node type: %v", imp.nodeType)
+	log.Logvf(log.Info, "connected to node type: %v", imp.nodeType)
 
 	if err = imp.configureSession(session); err != nil {
 		return 0, fmt.Errorf("error configuring session: %v", err)
@@ -189,7 +189,7 @@ func (imp *MongoDocGen) generateDocuments(documentGenerator TemplateDocumentGene
 
 	// drop the collection if necessary
 	if imp.IngestOptions.Drop {
-		log.Logf(log.Always, "dropping: %v.%v",
+		log.Logvf(log.Always, "dropping: %v.%v",
 			imp.ToolOptions.DB,
 			imp.ToolOptions.Collection)
 		collection := session.DB(imp.ToolOptions.DB).
@@ -270,7 +270,7 @@ func (imp *MongoDocGen) runInsertionWorker(readDocs chan bson.D) (err error) {
 	var documents []bson.Raw
 	numMessageBytes := 0
 
-	batchSize := imp.ToolOptions.BulkBufferSize
+	batchSize := 1000 //The default value of the circa v3.2 imp.ToolOptions.BulkBufferSize option, which used to be used here
 	j := 0
 readLoop:
 	for {
@@ -302,7 +302,7 @@ readLoop:
 				return err
 			}
 			if len(documentBytes) > maxBSONSize {
-				log.Logf(log.Always, "warning: attempting to insert document with size %v (exceeds %v limit)",
+				log.Logvf(log.Always, "warning: attempting to insert document with size %v (exceeds %v limit)",
 					text.FormatByteAmount(int64(len(documentBytes))), text.FormatByteAmount(maxBSONSize))
 			}
 			numMessageBytes += len(documentBytes)

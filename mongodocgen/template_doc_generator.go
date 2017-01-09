@@ -73,10 +73,10 @@ func makeBoundGeneratorFunc(m map[string]interface{}) (BoundTemplateFunc, error)
 			return nil, err
 		}
 		seqFunc := CreateNewSequenceFunc(opts.Start, opts.Step)
-		log.Logf(log.DebugLow, "A sequence for (Start = %f, Step = %f) is created.", gfn)
+		log.Logvf(log.DebugLow, "A sequence for (Start = %f, Step = %f) is created.", gfn)
 		return seqFunc, nil
 	} else {
-		log.Logf(log.Always, "A generator_func value %v was encountered. As it did not (case-sensitively) match any of the expected generator function names it is being ignored", gfn)
+		log.Logvf(log.Always, "A generator_func value %v was encountered. As it did not (case-sensitively) match any of the expected generator function names it is being ignored", gfn)
 	}
 	return nil, nil
 }
@@ -91,7 +91,7 @@ func appendMapAsBsonD (doc bson.D, m map[string]interface{}) bson.D {
 			if elem_found {
 				f, err = makeBoundGeneratorFunc(value.(map[string]interface{}))
 				if err != nil {
-					log.Logf(log.Always, "Could not parse \"%s\" (%#v) into a generator function due to following error: %s", name, value.(map[string]interface{}), err.Error())
+					log.Logvf(log.Always, "Could not parse \"%s\" (%#v) into a generator function due to following error: %s", name, value.(map[string]interface{}), err.Error())
 				}
 			}
 			if f != nil {
@@ -121,7 +121,7 @@ func appendArrayAsBsonD (doc bson.D, a []interface{}) []interface{} {
 			if elem_found {
 				f, err = makeBoundGeneratorFunc(arrayVal.(map[string]interface{}))
 				if err != nil {
-					log.Logf(log.Always, "Could not parse %#v into a generator function due to following error: %s", arrayVal.(map[string]interface{}), err.Error())
+					log.Logvf(log.Always, "Could not parse %#v into a generator function due to following error: %s", arrayVal.(map[string]interface{}), err.Error())
 				}
 			}
 			if f != nil {

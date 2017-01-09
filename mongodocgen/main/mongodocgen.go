@@ -25,8 +25,8 @@ func main() {
 
 	args, err := opts.Parse()
 	if err != nil {
-		log.Logf(log.Always, "error parsing command line options: %v", err)
-		log.Logf(log.Always, "try 'mongodocgen --help' for more information")
+		log.Logvf(log.Always, "error parsing command line options: %v", err)
+		log.Logvf(log.Always, "try 'mongodocgen --help' for more information")
 		os.Exit(util.ExitBadOptions)
 	}
 
@@ -50,7 +50,7 @@ func main() {
 	// create a session provider to connect to the db
 	sessionProvider, err := db.NewSessionProvider(*opts)
 	if err != nil {
-		log.Logf(log.Always, "error connecting to host: %v", err)
+		log.Logvf(log.Always, "error connecting to host: %v", err)
 		os.Exit(util.ExitError)
 	}
 
@@ -62,21 +62,21 @@ func main() {
 	}
 
 	if err = m.ValidateOptions(args); err != nil {
-		log.Logf(log.Always, "error validating options: %v", err)
-		log.Logf(log.Always, "try 'mongodocgen --help' for more information")
+		log.Logvf(log.Always, "error validating options: %v", err)
+		log.Logvf(log.Always, "try 'mongodocgen --help' for more information")
 		os.Exit(util.ExitError)
 	}
 
 	numDocs, err := m.GenerateDocuments()
 	if !opts.Quiet {
 		if err != nil {
-			log.Logf(log.Always, "Failed: %v", err)
+			log.Logvf(log.Always, "Failed: %v", err)
 		}
 		message := fmt.Sprintf("inserted 1 document")
 		if numDocs != 1 {
 			message = fmt.Sprintf("inserted %v documents", numDocs)
 		}
-		log.Logf(log.Always, message)
+		log.Logvf(log.Always, message)
 	}
 	if err != nil {
 		os.Exit(util.ExitError)

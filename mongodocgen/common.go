@@ -43,7 +43,7 @@ func filterIngestError(stopOnError bool, err error) error {
 	if stopOnError || db.IsConnectionError(err) {
 		return err
 	}
-	log.Logf(log.Always, "error inserting documents: %v", err)
+	log.Logvf(log.Always, "error inserting documents: %v", err)
 	return nil
 }
 
