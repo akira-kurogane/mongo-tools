@@ -31,6 +31,14 @@ func makeBoundGeneratorFunc(m map[string]interface{}) (BoundTemplateFunc, error)
 		return func() interface{} {
 			return RandomInt(opts.Min, opts.Max)
 		}, nil
+	//TODO: } else if gfn == "RandomBoolean" {
+		//opts, err := MapToRandomBooleanOpts(m) //to have a TrueLikelihood 0.0 ~ 1.0 argument
+		//if err != nil {
+		//	return nil, err
+		//}
+		//return func() interface{} {
+		//	return RandomBoolean(opts.TrueLikelihood)
+		//}, nil
 	} else if gfn == "ObjectId" {
 		return func() interface{} {
 			return NewObjectId()
